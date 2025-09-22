@@ -17,7 +17,7 @@ from medkit.core.text import TextDocument
 from operations import (
     NormalizeConfig, NormalizeOp,
     RewriteConfig, RewriteOp,
-    ChunkingConfig, ChunkingOp,
+    ChunkingConfig, ChunkingOp, AggregateChunksOp,
     EmbedConfig, TransformerEmbedOp,
     DPHeadConfig, TransformerDPHeadOp,
     LLMDPConfig, LLMDPInferenceOp,
@@ -87,19 +87,20 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         pass
 
     # 3) Chunking
-    steps.append(PipelineStep(
-        ChunkingOp(ChunkingConfig(
-            hf_model=args.hf_model,
-            chunk_size=args.chunk_size,
-            overlap=args.chunk_overlap,
-            field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent
-            field_out="chunks",
-        )),
-        ["docs"], ["docs"]
-    ))
-
+    
     # 4) Embeddings (pour backend=transformer)
     if args.backend == "transformer":
+        steps.append(PipelineStep(
+            ChunkingOp(ChunkingConfig(
+                hf_model=args.hf_model,
+                chunk_size=args.chunk_size,
+                overlap=args.chunk_overlap,
+                field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent
+                field_out="chunks",
+            )),
+            ["docs"], ["docs"]
+        ))
+
         steps.append(PipelineStep(
             TransformerEmbedOp(EmbedConfig(
                 hf_model=args.hf_model,
@@ -112,6 +113,10 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )),
             ["docs"], ["docs"]
         ))
+
+        steps.append(PipelineStep(AggregateChunksOp(strategy=tfm.get("aggregate", "mean")),
+                     ["docs"], ["docs"]))
+
 
         # 5) DP Head
         steps.append(PipelineStep(
