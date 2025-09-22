@@ -105,8 +105,8 @@ class RewriteOp(Operation):
         assert self._tok and self._lm
         target = f"\nLongueur cible: ~{self.cfg.target_words} mots." if self.cfg.target_words else ""
         prompt = (
-            "Réécris le compte rendu hospitalier ci-dessous en gardant le sens clinique, "
-            "en français clair, sans inventer d'informations." + target +
+            "Réécris et résume le compte rendu hospitalier ci-dessous en gardant le sens clinique, "
+            "en français clair, sans inventer d'informations, sachant que le but final sera de pouvoir éxtraire le diagnostic principal. " + target +
             "\nTexte:\n" + text.strip()
         )
         tok = self._tok(prompt, return_tensors="pt", truncation=True, max_length=4096)
@@ -145,35 +145,69 @@ class ChunkingConfig:
     field_out: str = "chunks"          # liste de str
 
 class ChunkingOp(Operation):
-    """Découpage token-based avec overlap, en gardant un mapping doc → chunks (texte brut)."""
-    def __init__(self, cfg: ChunkingConfig):
+    """
+    Découpe chaque doc en fenêtres de tokens de longueur ≤ chunk_size,
+    avec chevauchement 'stride'. Produit doc.metadata["chunks"] = [str, ...]
+    """
+    def __init__(self, hf_model: str, chunk_size: int = 448, stride: int = 96):
         super().__init__()
-        self.cfg = cfg
-        self._tok = AutoTokenizer.from_pretrained(self.cfg.hf_model, use_fast=True)
+        self.tok = AutoTokenizer.from_pretrained(hf_model, use_fast=True)
+        self.chunk_size = chunk_size
+        self.stride = stride
 
-    def _to_chunks(self, text: str) -> List[str]:
-        if not text:
-            return []
-        enc = self._tok(text, add_special_tokens=False)
-        ids = enc["input_ids"]
-        chunks = []
-        step = self.cfg.chunk_size - self.cfg.overlap
-        for start in range(0, len(ids), step if step > 0 else self.cfg.chunk_size):
-            end = start + self.cfg.chunk_size
-            sub_ids = ids[start:end]
-            if not sub_ids:
-                continue
-            chunks.append(self._tok.decode(sub_ids))
-            if end >= len(ids):
-                break
-        return chunks
-
-    def run(self, docs: Sequence[TextDocument]):
-        fi, fo = self.cfg.field_in, self.cfg.field_out
+    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
         for d in docs:
-            text = d.metadata.get(fi) or d.text
-            d.metadata[fo] = self._to_chunks(text)
-        return docs
+            text = d.text or ""
+            if not text.strip():
+                d.metadata["chunks"] = []
+                continue
+
+            # Encodage avec overflow pour générer les fenêtres
+            enc = self.tok(
+                text,
+                return_overflowing_tokens=True,
+                truncation=True,
+                max_length=self.chunk_size,
+                stride=self.stride,
+                return_offsets_mapping=False,
+                add_special_tokens=True,
+            )
+            # Recréer les textes de chunks à partir des input_ids (plus simple/robuste qu’offsets)
+            chunks = []
+            for ids in enc["input_ids"]:
+                # Retire les <s> </s> éventuels pour éviter d’empiler des tokens spéciaux
+                # NOTE: pour RoBERTa/CamemBERT, special tokens ~ {0,2}. On garde simple :
+                if len(ids) > 0 and ids[0] == self.tok.bos_token_id:
+                    ids = ids[1:]
+                if len(ids) > 0 and ids[-1] == self.tok.eos_token_id:
+                    ids = ids[:-1]
+                chunk_txt = self.tok.decode(ids, skip_special_tokens=True)
+                chunks.append(chunk_txt)
+
+            d.metadata["chunks"] = chunks
+        return list(docs)
+
+class AggregateChunksOp(Operation):
+    """
+    Agrège les embeddings de chunks en un seul embedding document (moyenne).
+    """
+    def __init__(self, strategy: str = "mean"):
+        super().__init__()
+        self.strategy = strategy
+
+    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
+        for d in docs:
+            chunk_embs = d.metadata.get("chunk_embs", [])
+            if not chunk_embs:
+                # doc vide → vecteur nul (dimension inconnue sans modèle ; on met None)
+                d.metadata["emb"] = None
+                continue
+            X = np.vstack(chunk_embs)  # (n_chunks, D)
+            if self.strategy == "mean" or True:
+                emb = X.mean(0)
+            # d’autres stratégies possibles: max, attn, tf-idf pondérée…
+            d.metadata["emb"] = emb.astype(np.float32)
+        return list(docs)
 
 
 # --------------------------- 4) Embeddings Transformer ------------------
@@ -189,48 +223,60 @@ class EmbedConfig:
     emb_field: str = "emb"
 
 class TransformerEmbedOp(Operation):
-    """Encode chaque chunk puis agrège (moyenne) → un embedding par document."""
-    def __init__(self, cfg: EmbedConfig):
+    """
+    Calcule un embedding par chunk (CLS mean des 4 dernières couches, ou mean-pooling tokens).
+    Stocke doc.metadata['chunk_embs'] = [np.array(D), ...]
+    """
+    def __init__(self, hf_model: str, device: str = "cpu",
+                 pooling: str = "cls4", max_length: int = 512):
         super().__init__()
-        self.cfg = cfg
-        self._tok = AutoTokenizer.from_pretrained(cfg.hf_model)
-        self._enc = AutoModel.from_pretrained(cfg.hf_model, output_hidden_states=True)
-        device = cfg.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = device
-        self._enc.to(self._device).eval()
+        from transformers import AutoModel, AutoTokenizer
+        self.tok = AutoTokenizer.from_pretrained(hf_model, use_fast=True)
+        self.enc = AutoModel.from_pretrained(hf_model, output_hidden_states=True)
+        self.device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
+        self.enc.to(self.device).eval()
+        self.pooling = pooling
+        self.max_length = max_length
 
     @torch.no_grad()
-    def _emb_one(self, text: str) -> np.ndarray:
-        t = self._tok(text, padding=True, truncation=True, max_length=self.cfg.max_length, return_tensors="pt")
-        t = {k: v.to(self._device) for k, v in t.items()}
-        out = self._enc(**t)
-        if self.cfg.pooling == "cls":
-            hs = out.hidden_states  # list of layers: (B, T, D)
-            sel = torch.stack(hs[-self.cfg.cls_layers:])[:, :, 0, :].mean(0)  # B×D sur [CLS]
-        else:
-            sel = out.last_hidden_state.mean(1)  # moyenne temporelle
-        return sel[0].detach().cpu().numpy()
+    def _embed_texts(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.enc.config.hidden_size), dtype=np.float32)
 
-    def run(self, docs: Sequence[TextDocument]):
+        batch = self.tok(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        ).to(self.device)
+        out = self.enc(**batch)
+        if self.pooling == "cls4":
+            # empile les 4 dernières couches, prend [CLS] (token 0), moyenne sur couches
+            hs = torch.stack(out.hidden_states[-4:])  # (4, B, T, D)
+            cls = hs[:, :, 0, :].mean(0)             # (B, D)
+            embs = cls
+        else:
+            # mean-pooling sur tokens valides (mask)
+            last = out.last_hidden_state             # (B, T, D)
+            mask = batch["attention_mask"].unsqueeze(-1)  # (B, T, 1)
+            summed = (last * mask).sum(1)
+            lens = mask.sum(1).clamp(min=1)
+            embs = summed / lens
+
+        return torch.nn.functional.normalize(embs, dim=1).cpu().numpy()
+
+    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
         for d in docs:
-            chunks = d.metadata.get(self.cfg.chunks_field) or [d.metadata.get("text_rw") or d.metadata.get("text_norm") or d.text]
-            vecs = []
-            for ch in chunks:
-                try:
-                    vecs.append(self._emb_one(ch))
-                except Exception:
-                    # si un chunk déconne (trop long après troncation improbable), on ignore
-                    continue
-            if not vecs:
-                # vecteur zéro de secours (dimension = D du modèle)
-                with torch.no_grad():
-                    dummy = self._emb_one((d.metadata.get("text_rw") or d.metadata.get("text_norm") or d.text)[:128])
-                vecs = [dummy * 0]
-            emb = np.mean(np.stack(vecs, axis=0), axis=0)
-            d.metadata[self.cfg.emb_field] = emb
-        return docs
+            chunks = d.metadata.get("chunks")
+            if not chunks:
+                chunks = [d.text or ""]
+            # Embedding par chunks en micro-batchs (évite OOM)
+            # Ici on emb alle d’un coup (si RAM ok) ; sinon découper par paquets.
+            embs = self._embed_texts(chunks)
+            d.metadata["chunk_embs"] = [e for e in embs]
+        return list(docs)
+
 
 
 # --------------------------- 5) Tête DP (Transformer) -------------------
@@ -307,7 +353,7 @@ class TransformerDPHeadOp(Operation):
         elif mode == "predict":
             bundle = self._load_bundle()
             if bundle is None:
-                raise FileNotFoundError(f"Bundle DP introuvable: {self.cfg.bundle_path}")
+                raise FileNotFoundError(f"Bundle DP introuvable: {self.cfg.bundle_path}, veuillez train un model avant de predict.")
             self._bundle = bundle
             return self._predict(docs, bundle)
         else:
