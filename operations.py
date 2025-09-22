@@ -30,7 +30,7 @@ from medkit.core.text import TextDocument
 
 # --------------------------- Utils génériques ---------------------------
 
-ICD10_REGEX = re.compile(r"\b[A-TV-Z][0-9]{2}(?:\.[0-9A-TV-Z]{1,4})?\b")
+ICD10_REGEX = re.compile(r"\b[A-TV-Z][0-9]{2}(?:\.[0-9A-TV-Z]{0,4})?\b")
 
 def first_icd10(text: str) -> Optional[str]:
     m = ICD10_REGEX.search(text or "")

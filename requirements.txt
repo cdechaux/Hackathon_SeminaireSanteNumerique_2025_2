@@ -1,0 +1,20 @@
+# --- Noyau scientifique ---
+numpy>=1.26,<3.0
+pandas>=2.2,<3.0
+scikit-learn>=1.4,<1.6
+joblib>=1.3,<2.0
+tqdm>=4.66,<5.0
+
+# --- Inference Transformers (100% local) ---
+torch>=2.4,<2.6           # CPU/GPU selon machine 
+transformers>=4.43,<5.0
+accelerate>=0.31,<1.0
+safetensors>=0.4,<1.0
+tokenizers>=0.15,<0.20
+sentencepiece>=0.1.99    
+
+# --- Medkit (pipeline, documents, opérations) ---
+medkit-lib>=0.17.0
+
+# --- Optionnel (décommente si besoin) ---
+# bitsandbytes>=0.43        # quantification 4/8-bit (Linux recommandé)
