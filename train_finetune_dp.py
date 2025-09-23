@@ -193,7 +193,7 @@ def main():
         save_steps=args.eval_every if eval_ds is not None else 1000,
         save_total_limit=args.save_total_limit,
         load_best_model_at_end=bool(eval_ds is not None),
-        metric_for_best_model="macro_f1",
+        metric_for_best_model="eval_loss",
         fp16=args.fp16,
         bf16=args.bf16,
         report_to=[],
