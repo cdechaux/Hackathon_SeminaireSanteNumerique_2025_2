@@ -145,69 +145,59 @@ class ChunkingConfig:
     field_out: str = "chunks"          # liste de str
 
 class ChunkingOp(Operation):
-    """
-    Découpe chaque doc en fenêtres de tokens de longueur ≤ chunk_size,
-    avec chevauchement 'stride'. Produit doc.metadata["chunks"] = [str, ...]
-    """
-    def __init__(self, hf_model: str, chunk_size: int = 448, stride: int = 96):
+    def __init__(self, cfg: ChunkingConfig):
         super().__init__()
-        self.tok = AutoTokenizer.from_pretrained(hf_model, use_fast=True)
-        self.chunk_size = chunk_size
-        self.stride = stride
+        self.cfg = cfg
+        self.tok = AutoTokenizer.from_pretrained(cfg.hf_model, use_fast=True)
 
-    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
+    def run(self, docs: Sequence[TextDocument]):
         for d in docs:
-            text = d.text or ""
-            if not text.strip():
-                d.metadata["chunks"] = []
+            text = (d.metadata.get(self.cfg.field_in) or d.text or "").strip()
+            if not text:
+                d.metadata[self.cfg.field_out] = []
                 continue
 
-            # Encodage avec overflow pour générer les fenêtres
             enc = self.tok(
                 text,
                 return_overflowing_tokens=True,
                 truncation=True,
-                max_length=self.chunk_size,
-                stride=self.stride,
+                max_length=self.cfg.chunk_size,
+                stride=self.cfg.overlap,           # <-- overlap
                 return_offsets_mapping=False,
                 add_special_tokens=True,
             )
-            # Recréer les textes de chunks à partir des input_ids (plus simple/robuste qu’offsets)
+
             chunks = []
             for ids in enc["input_ids"]:
-                # Retire les <s> </s> éventuels pour éviter d’empiler des tokens spéciaux
-                # NOTE: pour RoBERTa/CamemBERT, special tokens ~ {0,2}. On garde simple :
-                if len(ids) > 0 and ids[0] == self.tok.bos_token_id:
-                    ids = ids[1:]
-                if len(ids) > 0 and ids[-1] == self.tok.eos_token_id:
-                    ids = ids[:-1]
                 chunk_txt = self.tok.decode(ids, skip_special_tokens=True)
                 chunks.append(chunk_txt)
 
-            d.metadata["chunks"] = chunks
+            d.metadata[self.cfg.field_out] = chunks
         return list(docs)
 
 class AggregateChunksOp(Operation):
-    """
-    Agrège les embeddings de chunks en un seul embedding document (moyenne).
-    """
-    def __init__(self, strategy: str = "mean"):
+    def __init__(self, strategy: str = "mean",
+                 chunks_emb_field: str = "chunk_embs",
+                 emb_field: str = "emb"):
         super().__init__()
         self.strategy = strategy
+        self.chunks_emb_field = chunks_emb_field
+        self.emb_field = emb_field
 
-    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
+    def run(self, docs: Sequence[TextDocument]):
         for d in docs:
-            chunk_embs = d.metadata.get("chunk_embs", [])
-            if not chunk_embs:
-                # doc vide → vecteur nul (dimension inconnue sans modèle ; on met None)
-                d.metadata["emb"] = None
+            arrs = d.metadata.get(self.chunks_emb_field) or []
+            if len(arrs) == 0:
+                d.metadata[self.emb_field] = None
                 continue
-            X = np.vstack(chunk_embs)  # (n_chunks, D)
-            if self.strategy == "mean" or True:
+            X = np.vstack(arrs)
+            if self.strategy == "mean":
                 emb = X.mean(0)
-            # d’autres stratégies possibles: max, attn, tf-idf pondérée…
-            d.metadata["emb"] = emb.astype(np.float32)
+            else:
+                emb = X.mean(0)  # fallback
+            d.metadata[self.emb_field] = emb.astype(np.float32)
         return list(docs)
+
 
 
 # --------------------------- 4) Embeddings Transformer ------------------
@@ -215,65 +205,60 @@ class AggregateChunksOp(Operation):
 @dataclass
 class EmbedConfig:
     hf_model: str
-    device: str = "auto"        # "cuda" | "cpu" | "auto"
+    device: str = "cpu"         # "cpu" | "cuda" | "auto"
     max_length: int = 512
-    pooling: str = "cls"        # "cls" ou "mean"
-    cls_layers: int = 1         # nb de derniers layers à moyenner (si pooling=cls)
+    pooling: str = "cls4"
+    cls_layers: int = 4
     chunks_field: str = "chunks"
     emb_field: str = "emb"
 
 class TransformerEmbedOp(Operation):
-    """
-    Calcule un embedding par chunk (CLS mean des 4 dernières couches, ou mean-pooling tokens).
-    Stocke doc.metadata['chunk_embs'] = [np.array(D), ...]
-    """
-    def __init__(self, hf_model: str, device: str = "cpu",
-                 pooling: str = "cls4", max_length: int = 512):
+    def __init__(self, cfg: EmbedConfig):
         super().__init__()
-        from transformers import AutoModel, AutoTokenizer
-        self.tok = AutoTokenizer.from_pretrained(hf_model, use_fast=True)
-        self.enc = AutoModel.from_pretrained(hf_model, output_hidden_states=True)
-        self.device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
+        self.cfg = cfg
+        self.tok = AutoTokenizer.from_pretrained(cfg.hf_model, use_fast=True)
+        from transformers import AutoModel
+        self.enc = AutoModel.from_pretrained(cfg.hf_model, output_hidden_states=True)
+        if cfg.device == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            dev = cfg.device
+        self.device = dev
         self.enc.to(self.device).eval()
-        self.pooling = pooling
-        self.max_length = max_length
 
     @torch.no_grad()
     def _embed_texts(self, texts: List[str]) -> np.ndarray:
         if not texts:
-            return np.zeros((0, self.enc.config.hidden_size), dtype=np.float32)
-
+            D = self.enc.config.hidden_size
+            return np.zeros((0, D), dtype=np.float32)
         batch = self.tok(
             texts,
             padding=True,
             truncation=True,
-            max_length=self.max_length,
+            max_length=self.cfg.max_length,
             return_tensors="pt"
         ).to(self.device)
         out = self.enc(**batch)
-        if self.pooling == "cls4":
-            # empile les 4 dernières couches, prend [CLS] (token 0), moyenne sur couches
-            hs = torch.stack(out.hidden_states[-4:])  # (4, B, T, D)
-            cls = hs[:, :, 0, :].mean(0)             # (B, D)
-            embs = cls
+
+        if self.cfg.pooling == "cls4":
+            hs = torch.stack(out.hidden_states[-self.cfg.cls_layers:])  # (L,B,T,D)
+            embs = hs[:, :, 0, :].mean(0)  # (B,D)
         else:
-            # mean-pooling sur tokens valides (mask)
-            last = out.last_hidden_state             # (B, T, D)
-            mask = batch["attention_mask"].unsqueeze(-1)  # (B, T, 1)
-            summed = (last * mask).sum(1)
-            lens = mask.sum(1).clamp(min=1)
-            embs = summed / lens
+            last = out.last_hidden_state
+            mask = batch["attention_mask"].unsqueeze(-1)
+            embs = (last * mask).sum(1) / mask.sum(1).clamp(min=1)
 
-        return torch.nn.functional.normalize(embs, dim=1).cpu().numpy()
+        embs = torch.nn.functional.normalize(embs, dim=1)
+        return embs.cpu().numpy()
 
-    def run(self, docs: Sequence[TextDocument]) -> List[TextDocument]:
+    def run(self, docs: Sequence[TextDocument]):
         for d in docs:
-            chunks = d.metadata.get("chunks")
+            chunks = d.metadata.get(self.cfg.chunks_field)
             if not chunks:
-                chunks = [d.text or ""]
-            # Embedding par chunks en micro-batchs (évite OOM)
-            # Ici on emb alle d’un coup (si RAM ok) ; sinon découper par paquets.
+                chunks = [ (d.metadata.get("text_rw") or d.text or "") ]
             embs = self._embed_texts(chunks)
+            # Agrégation plus tard → on stocke les embs de chunks pour l’instant ?
+            # Si tu veux déjà agrégér ici, tu peux faire une moyenne directement.
             d.metadata["chunk_embs"] = [e for e in embs]
         return list(docs)
 

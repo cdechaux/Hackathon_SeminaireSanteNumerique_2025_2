@@ -114,8 +114,10 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             ["docs"], ["docs"]
         ))
 
-        steps.append(PipelineStep(AggregateChunksOp(strategy=tfm.get("aggregate", "mean")),
-                     ["docs"], ["docs"]))
+        steps.append(PipelineStep(
+            AggregateChunksOp(strategy=args.aggregate),
+            ["docs"], ["docs"]
+        ))
 
 
         # 5) DP Head
