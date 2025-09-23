@@ -123,7 +123,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-total-limit", type=int, default=2)
-    p.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=4)
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -184,15 +184,16 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
+        lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
-        evaluation_strategy="steps" if eval_ds is not None else "no",
+        eval_strategy="steps" if eval_ds is not None else "no",
         eval_steps=args.eval_every if eval_ds is not None else None,
         logging_steps=100,
         save_steps=args.eval_every if eval_ds is not None else 1000,
         save_total_limit=args.save_total_limit,
         load_best_model_at_end=bool(eval_ds is not None),
-        metric_for_best_model="eval_loss",
+        metric_for_best_model="macro_f1",
         fp16=args.fp16,
         bf16=args.bf16,
         report_to=[],
