@@ -23,7 +23,7 @@ import torch
 
 from sklearn.linear_model import LogisticRegression
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification
 
 from medkit.core.operation import Operation
 from medkit.core.text import TextDocument
@@ -343,9 +343,89 @@ class TransformerDPHeadOp(Operation):
             return self._predict(docs, bundle)
         else:
             raise ValueError("mode doit être 'train' ou 'predict'")
+        
+
+# --------------------------- 6) Transformer finetune ------------------
+
+@dataclass
+class HFDocPredictConfig:
+    checkpoint_dir: str                # dossier du checkpoint HF (celui de train_finetune_dp.py)
+    device: str = "auto"               # "cuda" / "cpu" / "auto"
+    max_length: int = 384              # par sécurité si chunks absents
+    stride: int = 64                   # idem
+    chunks_field: str = "chunks"       # fourni par ChunkingOp (list[str])
+    pred_field: str = "pred_dp"        # sortie
+    aggregate: str = "mean"            # "mean" | "max" | "median"
+    return_proba: bool = True
+
+class HFDocClassifierOp(Operation):
+    """Inférence DP avec un modèle HF fine-tuné (doc-level via agrégation des logits de chunks)."""
+
+    def __init__(self, cfg: HFDocPredictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.checkpoint_dir, use_fast=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(cfg.checkpoint_dir)
+        self.model.eval()
+        dev = cfg.device
+        if dev == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(dev)
+        self.model.to(self.device)
+
+        # id2label depuis config
+        self.id2label = self.model.config.id2label if hasattr(self.model.config, "id2label") else {}
+        # fallback si jamais non présent
+        if not self.id2label or not isinstance(list(self.id2label.keys())[0], int):
+            # HF peut sauver id2label avec clés str; normalisons
+            try:
+                self.id2label = {int(k): v for k, v in self.model.config.id2label.items()}  # type: ignore
+            except Exception:
+                pass
+
+    def _aggregate(self, logits: np.ndarray) -> np.ndarray:
+        if self.cfg.aggregate == "mean":
+            return logits.mean(axis=0)
+        if self.cfg.aggregate == "max":
+            return logits.max(axis=0)
+        if self.cfg.aggregate == "median":
+            return np.median(logits, axis=0)
+        return logits.mean(axis=0)
+
+    @torch.no_grad()
+    def run(self, docs: Sequence[TextDocument]):  # type: ignore[override]
+        for d in docs:
+            chunks: Optional[List[str]] = d.metadata.get(self.cfg.chunks_field)  # type: ignore
+            if not chunks:
+                chunks = [d.text]
+
+            chunk_logits = []
+            for ch in chunks:
+                enc = self.tokenizer(
+                    ch, truncation=True, padding=False,
+                    max_length=self.cfg.max_length, return_tensors="pt"
+                )
+                enc = {k: v.to(self.device) for k, v in enc.items()}
+                out = self.model(**enc)
+                logit = out.logits.detach().cpu().numpy()  # (1, num_labels)
+                chunk_logits.append(logit[0])
+
+            logits = np.stack(chunk_logits, axis=0)          # (n_chunks, num_labels)
+            agg = self._aggregate(logits)                     # (num_labels,)
+            pred_id = int(np.argmax(agg))
+            label = self.id2label.get(pred_id, str(pred_id))
+
+            if self.cfg.return_proba:
+                proba = float(torch.softmax(torch.tensor(agg), dim=-1)[pred_id].item())
+                d.metadata[self.cfg.pred_field] = {"code": label, "score": proba}
+            else:
+                d.metadata[self.cfg.pred_field] = {"code": label}
+
+        return list(docs)
 
 
-# --------------------------- 6) LLM DP (Transformers) -------------------
+
+# --------------------------- 7) LLM DP (Transformers) -------------------
 
 @dataclass
 class LLMDPConfig:

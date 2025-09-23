@@ -20,6 +20,7 @@ from operations import (
     ChunkingConfig, ChunkingOp, AggregateChunksOp,
     EmbedConfig, TransformerEmbedOp,
     DPHeadConfig, TransformerDPHeadOp,
+    HFDocPredictConfig, HFDocClassifierOp,
     LLMDPConfig, LLMDPInferenceOp,
 )
 
@@ -45,10 +46,18 @@ def load_docs_from_csv(csv_path: Path, col_text: str, col_dp: str | None, col_pa
 def write_preds_to_csv(docs: List[TextDocument], out_csv: Path, out_col_sejour: str, out_col_pred: str):
     rows = []
     for d in docs:
-        sejour = d.metadata.get("id_sejour", "")
+        sid = d.metadata.get("id_sejour", "")
         pred = d.metadata.get("pred_dp", "")
-        rows.append({out_col_sejour: sejour, out_col_pred: pred})
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
+        # >>> forcer "code" si dict
+        if isinstance(pred, dict):
+            pred = pred.get("code", "")
+        rows.append({out_col_sejour: sid, out_col_pred : pred})
+
+    import csv
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[out_col_sejour, out_col_pred])
+        w.writeheader()
+        w.writerows(rows)
 
 
 # ----------------------- Pipeline builder -----------------------
@@ -134,6 +143,24 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             ["docs"], ["docs_out"]
         ))
 
+    elif args.backend == "hf_finetuned":
+        if not args.hf_checkpoint:
+            raise ValueError("Veuillez fournir --hf-checkpoint (dossier HF sauvegardé par train_finetune_dp.py)")
+        # ----- modèle HF fine-tuné pour le DP -----
+        steps.append(PipelineStep(
+            HFDocClassifierOp(HFDocPredictConfig(
+                checkpoint_dir=args.hf_checkpoint,
+                device=args.device if args.device in ("cpu","cuda") else "auto",
+                max_length=args.max_length,
+                stride=args.chunk_overlap,      # pas utilisé ici, sécurité
+                chunks_field="chunks",
+                pred_field="pred_dp",
+                aggregate=args.aggregate_hf,
+                return_proba=True,
+            )),
+            ["docs"], ["docs_out"]
+        ))
+
     elif args.backend == "llm":
         # 4) LLM direct (pas d'embeddings)
         steps.append(PipelineStep(
@@ -172,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-col-pred", default="dp_predit")
 
     # Backend & mode
-    p.add_argument("--backend", choices=["transformer", "llm"], default="transformer")
+    p.add_argument("--backend", choices=["transformer", "hf_finetuned", "llm"], default="transformer")
     p.add_argument("--mode", choices=["train", "predict"], default="predict")
 
     # Modèle encoder (transformer)
@@ -185,6 +212,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-C", type=float, default=1.0)
     p.add_argument("--lr-max-iter", type=int, default=200)
     p.add_argument("--aggregate", choices=["mean", "max", "first"], default="mean",help="Stratégie d’agrégation des embeddings de chunks en un seul vecteur doc.")
+
+    # Transformer finetune
+    p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné (pour backend=hf_finetuned)")
+    p.add_argument("--aggregate_hf", choices=["mean", "max", "median"], default="mean")
 
 
     # LLM (Transformers)
