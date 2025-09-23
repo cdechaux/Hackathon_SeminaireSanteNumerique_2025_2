@@ -12,6 +12,7 @@ accelerate>=0.31,<1.0
 safetensors>=0.4,<1.0
 tokenizers>=0.15,<0.20
 sentencepiece>=0.1.99    
+datasets
 
 # --- Medkit (pipeline, documents, opérations) ---
 medkit-lib>=0.17.0

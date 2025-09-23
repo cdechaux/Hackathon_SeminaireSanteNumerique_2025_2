@@ -1,252 +1,341 @@
 #!/usr/bin/env python3
-# train_finetune_dp.py
+# -*- coding: utf-8 -*-
+"""
+Fine-tuning DP (mono-label) avec split **par classe**.
+
+Option 3 (recommandée si certaines classes sont rares):
+- Pour chaque classe c:
+  * si n_c == 1  -> sample unique en TRAIN (exclu de la val)
+  * si n_c >= 2  -> au moins 1 échantillon en VAL (reste en TRAIN)
+- Respecte approx. une fraction globale --val-frac (par défaut 0.1) sans vider le train.
+
+Sauvegarde:
+- output_dir/
+    - label_map.json
+    - train.csv / val.csv
+    - config_train.json
+    - checkpoints/ ...
+
+Exemple:
+python train_finetune_dp.py \
+  --input-csv dp_dataset.csv \
+  --text-col text --label-col code_dp \
+  --output-dir checkpoints/camembert_dp_ft \
+  --pretrained almanach/camembert-bio-base \
+  --epochs 3 --batch-size 8 --lr 2e-5 --fp16
+"""
 from __future__ import annotations
-import argparse, os, json, math, random
-from dataclasses import dataclass
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
 from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import f1_score, accuracy_score
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    Trainer,
+    TrainingArguments,
+)
+from torch import nn
+from torch.utils.data import Dataset
+from dataclasses import dataclass
 
-from datasets import Dataset, DatasetDict
-from transformers import (AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments)
-from transformers.trainer_utils import EvalPrediction
-from sklearn.metrics import f1_score, precision_recall_fscore_support
-from sklearn.model_selection import train_test_split
 
-# --------------------------- Helpers ---------------------------
+# =============== Utils I/O ===============
+
+def save_json(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
 
 def set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def build_label_map(codes: List[str]) -> Tuple[Dict[str,int], Dict[int,str]]:
-    uniq = sorted(set(codes))
-    label2id = {c:i for i,c in enumerate(uniq)}
-    id2label = {i:c for c,i in label2id.items()}
-    return label2id, id2label
 
-def chunk_encode(
-    texts: List[str],
-    tokenizer: AutoTokenizer,
-    max_length: int,
-    stride: int
-):
-    """Tokenize en autorisant le débordement (overflow) pour générer des chunks."""
-    enc = tokenizer(
-        texts,
-        truncation=True,
-        padding=False,
-        max_length=max_length,
-        return_overflowing_tokens=True,
-        stride=stride,
-    )
-    return enc
+# =============== Datasets HF ===============
 
-# --------------------------- Main ---------------------------
+class TextLabelDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, text_col: str, label_col: str, label2id: Dict[str, int], tokenizer, max_length: int = 512):
+        self.texts = df[text_col].astype(str).tolist()
+        self.labels = [label2id[l] for l in df[label_col].tolist()]
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, i):
+        txt = self.texts[i]
+        enc = self.tokenizer(
+            txt,
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors=None,
+        )
+        enc["labels"] = self.labels[i]
+        return enc
+
+
+# =============== Model wrapper avec class weights ===============
+
+class WeightedCELossModel(nn.Module):
+    """
+    Enveloppe AutoModelForSequenceClassification pour appliquer une CrossEntropy pondérée.
+    """
+    def __init__(self, base_model: AutoModelForSequenceClassification, class_weights: torch.Tensor | None):
+        super().__init__()
+        self.base = base_model
+        self.register_buffer("class_weights", class_weights if class_weights is not None else None)
+
+    def forward(self, **kwargs):
+        labels = kwargs.get("labels", None)
+        outputs = self.base(**{k: v for k, v in kwargs.items() if k != "labels"})
+        logits = outputs.logits
+        loss = None
+        if labels is not None:
+            if self.class_weights is not None:
+                loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels)
+        return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
+
+
+# =============== Split par classe (Option 3) ===============
+
+def split_by_class(
+    df: pd.DataFrame,
+    label_col: str,
+    val_frac: float = 0.1,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Dict[str, int]]]:
+    """
+    Split manuel par classe:
+      - si n_c == 1: tout en TRAIN
+      - si n_c >= 2: au moins 1 en VAL; on vise ~val_frac globalement, mais sans vider train
+    Retourne (train_df, val_df, stats)
+    """
+    rng = np.random.default_rng(seed)
+    classes = df[label_col].unique().tolist()
+    grouped = {c: df[df[label_col] == c].sample(frac=1.0, random_state=seed) for c in classes}
+
+    total = len(df)
+    target_val = int(round(val_frac * total))
+    picked_val = 0
+
+    train_rows = []
+    val_rows = []
+
+    stats = {}
+
+    for c, g in grouped.items():
+        n = len(g)
+        if n == 1:
+            # train only
+            train_rows.append(g)
+            stats[c] = {"train": 1, "val": 0, "total": 1}
+            continue
+
+        # nombre cible pour cette classe si on proportionne sur val_frac
+        cand_val = int(math.floor(n * val_frac))
+        cand_val = max(cand_val, 1)  # au moins 1 en val
+        cand_val = min(cand_val, n - 1)  # laisser au moins 1 en train
+
+        # Ajustement global: si on a déjà dépassé la cible globale, on réduit localement
+        # (sans descendre en dessous de 1 pour n>=2)
+        if picked_val + cand_val > target_val:
+            # reste possible globalement
+            remaining = max(target_val - picked_val, 0)
+            if remaining >= 1:
+                cand_val = max(1, min(cand_val, remaining))
+            # sinon si remaining == 0, mettre le minimum (1), mais ça dépassera légèrement la cible globale
+            # on garde 1 pour respecter la règle "au moins 1 en val"
+        val_rows.append(g.iloc[:cand_val])
+        train_rows.append(g.iloc[cand_val:])
+
+        picked_val += cand_val
+        stats[c] = {"train": n - cand_val, "val": cand_val, "total": n}
+
+    train_df = pd.concat(train_rows, axis=0, ignore_index=True)
+    val_df = pd.concat(val_rows, axis=0, ignore_index=True) if len(val_rows) else pd.DataFrame(columns=df.columns)
+
+    # Shuffle final
+    train_df = train_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    val_df = val_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    # Rapport synthétique
+    nb_val_zero = sum(1 for c, s in stats.items() if s["val"] == 0)
+    print(f"[SPLIT] Total={total} | target_val≈{target_val} | picked_val={picked_val} | classes sans val={nb_val_zero}")
+
+    return train_df, val_df, stats
+
+
+# =============== Metrics ===============
+
+def compute_metrics(eval_pred, id2label: Dict[int, str]):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    acc = accuracy_score(labels, preds)
+    f1_macro = f1_score(labels, preds, average="macro", zero_division=0)
+    f1_micro = f1_score(labels, preds, average="micro", zero_division=0)
+    return {"accuracy": acc, "f1_macro": f1_macro, "f1_micro": f1_micro}
+
+
+# =============== Main ===============
 
 def main():
-    p = argparse.ArgumentParser("Fine-tune DP classifier (HF) with chunking + doc-level eval")
-    p.add_argument("--input-csv", required=True)
-    p.add_argument("--text-col", default="text")
-    p.add_argument("--label-col", default="code_dp")
-    p.add_argument("--output-dir", required=True)  # dossier HF à créer (checkpoint)
-    p.add_argument("--pretrained", default="almanach/camembert-bio-base")
+    parser = argparse.ArgumentParser("Fine-tune DP (option 3: split par classe)")
+    parser.add_argument("--input-csv", required=True)
+    parser.add_argument("--text-col", required=True, help="Nom de la colonne texte")
+    parser.add_argument("--label-col", required=True, help="Nom de la colonne DP (mono-label)")
+    parser.add_argument("--output-dir", required=True)
 
-    # chunking/tokenization
-    p.add_argument("--max-length", type=int, default=384)       # en tokens
-    p.add_argument("--stride", type=int, default=64)            # en tokens
+    parser.add_argument("--pretrained", default="almanach/camembert-bio-base")
+    parser.add_argument("--max-length", type=int, default=512)
 
-    # training
-    p.add_argument("--epochs", type=float, default=3.0)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--warmup-ratio", type=float, default=0.06)
-    p.add_argument("--eval-size", type=float, default=0.1)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--fp16", action="store_true")
-    p.add_argument("--bf16", action="store_true")
+    parser.add_argument("--val-frac", type=float, default=0.1, help="Fraction globale visée pour la validation")
+    parser.add_argument("--seed", type=int, default=42)
 
-    # class imbalance
-    p.add_argument("--class-weights", action="store_true", help="Active weighted CE (inverse freq)")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--weighting", choices=["none", "inverse_freq", "effective_num"], default="inverse_freq",
+                        help="Pondération de la CE: none | inverse_freq | effective_num")
 
-    args = p.parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--eval-steps", type=int, default=500)
+    parser.add_argument("--logging-steps", type=int, default=50)
+    parser.add_argument("--warmup-ratio", type=float, default=0.06)
+    parser.add_argument("--grad-accum", type=int, default=1)
+
+    args = parser.parse_args()
+
     set_seed(args.seed)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-    # --------- Load data ----------
+    # 1) Lecture
     df = pd.read_csv(args.input_csv)
     if args.text_col not in df.columns or args.label_col not in df.columns:
-        raise ValueError(f"Colonnes attendues absentes. Trouvées: {df.columns.tolist()}")
+        raise ValueError(f"Colonnes manquantes. Trouvé: {df.columns.tolist()}")
 
-    # Label mapping
-    label2id, id2label = build_label_map(df[args.label_col].tolist())
+    # Nettoyage basique
+    df = df[[args.text_col, args.label_col]].dropna().reset_index(drop=True)
+    df[args.text_col] = df[args.text_col].astype(str).str.strip()
+    df[args.label_col] = df[args.label_col].astype(str).str.strip()
 
-    # Split train/eval stratifié sur DP
-    train_df, eval_df = train_test_split(
-        df, test_size=args.eval_size, random_state=args.seed,
-        stratify=df[args.label_col]
-    )
-    train_df = train_df.reset_index(drop=True)
-    eval_df  = eval_df.reset_index(drop=True)
+    # 2) Split par classe (option 3)
+    train_df, val_df, stats = split_by_class(df, args.label_col, val_frac=args.val_frac, seed=args.seed)
 
+    # 3) Label map (sur TOUT l'ensemble)
+    labels_sorted = sorted(df[args.label_col].unique().tolist())
+    label2id = {lab: i for i, lab in enumerate(labels_sorted)}
+    id2label = {i: lab for lab, i in label2id.items()}
+
+    save_json({"label2id": label2id, "id2label": id2label}, out / "label_map.json")
+    save_json({"split_stats": stats}, out / "split_stats.json")
+    train_df.to_csv(out / "train.csv", index=False)
+    val_df.to_csv(out / "val.csv", index=False)
+
+    # 4) Tokenizer & config/model
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=True)
-
-    # On stocke doc_ids pour l'éval doc-level
-    train_doc_ids = list(range(len(train_df)))
-    eval_doc_ids  = list(range(len(eval_df)))
-
-    # --------- Build chunked datasets ----------
-    def build_chunked(ds_df: pd.DataFrame, doc_ids: List[int]):
-        texts = ds_df[args.text_col].astype(str).tolist()
-        labels = [label2id[c] for c in ds_df[args.label_col].tolist()]
-
-        enc = chunk_encode(texts, tokenizer, args.max_length, args.stride)
-
-        # map overflow_to_sample_mapping pour savoir quel chunk vient de quel doc
-        doc_map = enc.pop("overflow_to_sample_mapping")
-        # doc_id par chunk + label par chunk
-        chunk_doc_ids = [doc_ids[i] for i in doc_map]
-        chunk_labels  = [labels[i]  for i in doc_map]
-
-        # dataset HF
-        data_dict = {k: enc[k] for k in ["input_ids", "attention_mask"]}
-        data_dict["labels"]   = chunk_labels
-        data_dict["doc_id"]   = chunk_doc_ids   # pour compute_metrics
-        return Dataset.from_dict(data_dict), doc_ids
-
-    train_hf, _  = build_chunked(train_df, train_doc_ids)
-    eval_hf,  _  = build_chunked(eval_df,  eval_doc_ids)
-
-    dsd = DatasetDict({"train": train_hf, "validation": eval_hf})
-
-    # --------- Model ----------
-    num_labels = len(label2id)
-    model = AutoModelForSequenceClassification.from_pretrained(
+    config = AutoConfig.from_pretrained(
         args.pretrained,
-        num_labels=num_labels,
-        id2label={i: id2label[i] for i in range(num_labels)},
-        label2id={k: v for k, v in label2id.items()},
-        problem_type="single_label_classification",
+        num_labels=len(label2id),
+        id2label={i: l for i, l in enumerate(labels_sorted)},
+        label2id={l: i for i, l in enumerate(labels_sorted)},
     )
+    base_model = AutoModelForSequenceClassification.from_pretrained(args.pretrained, config=config)
 
-    # Option: class weights
-    ce_weight = None
-    if args.class_weights:
-        # compute weights on train set labels
-        y = np.array(train_hf["labels"])
-        uniq, counts = np.unique(y, return_counts=True)
-        inv_freq = {u: (1.0 / c) for u, c in zip(uniq, counts)}
-        # normalize
-        s = sum(inv_freq.values())
-        inv_freq = {k: v / s * len(inv_freq) for k, v in inv_freq.items()}
-        weight_vec = np.zeros(num_labels, dtype=np.float32)
-        for k,v in inv_freq.items():
-            weight_vec[k] = v
-        ce_weight = torch.tensor(weight_vec)
+    # 5) Poids de classe
+    class_weights = None
+    if args.weighting != "none":
+        # comptages sur TRAIN uniquement
+        counts = train_df[args.label_col].value_counts().reindex(labels_sorted, fill_value=0).astype(float).values
+        if args.weighting == "inverse_freq":
+            w = 1.0 / np.maximum(counts, 1.0)
+            w = (w / w.mean()).astype(np.float32)
+        else:
+            # effective number (Cui et al. 2019)
+            beta = 0.999
+            effective_num = 1.0 - np.power(beta, counts)
+            w = (1.0 - beta) / np.maximum(effective_num, 1e-9)
+            w = (w / w.mean()).astype(np.float32)
+        class_weights = torch.tensor(w)
 
-        # wrap default loss fn inside trainer later (via model hook)
-        def compute_loss_with_weights(model, inputs, return_outputs=False):
-            labels = inputs.pop("labels")
-            outputs = model(**inputs)
-            logits = outputs.logits
-            loss_fct = torch.nn.CrossEntropyLoss(weight=ce_weight.to(logits.device))
-            loss = loss_fct(logits, labels)
-            return (loss, outputs) if return_outputs else loss
+        print("[CLASS WEIGHTS]", dict(zip(labels_sorted, w.round(3))))
 
-    # --------- Metrics (doc-level) ----------
-    def compute_metrics(eval_pred: EvalPrediction):
-        logits, labels = eval_pred.predictions, eval_pred.label_ids   # chunk-level
-        # On récupère doc_ids dans l'ordre de l'eval set
-        doc_ids = eval_hf["doc_id"]
+    model = WeightedCELossModel(base_model, class_weights)
 
-        # Agrégation des logits par doc_id
-        # (on fait une moyenne simple; max/median/attention-pooling possible)
-        by_doc: Dict[int, List[np.ndarray]] = {}
-        for logit, did in zip(logits, doc_ids):
-            by_doc.setdefault(did, []).append(logit)
+    # 6) Datasets
+    train_ds = TextLabelDataset(train_df, args.text_col, args.label_col, label2id, tokenizer, args.max_length)
+    eval_ds = TextLabelDataset(val_df, args.text_col, args.label_col, label2id, tokenizer, args.max_length) if len(val_df) else None
 
-        y_true_doc, y_pred_doc = [], []
-        for did, chunks in by_doc.items():
-            agg = np.mean(np.stack(chunks, axis=0), axis=0)
-            pred = int(np.argmax(agg))
-            # label "or" au niveau doc : on récupère le label du doc via le premier chunk trouvé
-            # (tous les chunks d'un doc partagent le même label ici)
-            # On prend le label correspondant au premier chunk du doc:
-            idx_first_chunk = next(i for i, d in enumerate(doc_ids) if d == did)
-            gold = int(labels[idx_first_chunk])
-            y_true_doc.append(gold); y_pred_doc.append(pred)
-
-        p, r, f1, _ = precision_recall_fscore_support(y_true_doc, y_pred_doc, average="macro", zero_division=0)
-        p_micro, r_micro, f1_micro, _ = precision_recall_fscore_support(y_true_doc, y_pred_doc, average="micro", zero_division=0)
-
-        return {
-            "macro_p": float(p),
-            "macro_r": float(r),
-            "macro_f1": float(f1),
-            "micro_p": float(p_micro),
-            "micro_r": float(r_micro),
-            "micro_f1": float(f1_micro),
-        }
-
-    # --------- Trainer ----------
-    args_train = TrainingArguments(
-        output_dir=args.output_dir,
+    # 7) TrainingArguments
+    training_args = TrainingArguments(
+        output_dir=str(out / "checkpoints"),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="macro_f1",
-        greater_is_better=True,
         fp16=args.fp16,
-        bf16=args.bf16,
-        logging_steps=50,
-        save_total_limit=2,
-        dataloader_num_workers=2,
-        report_to=[],  # pas de wandb par défaut
-        seed=args.seed,
+        evaluation_strategy="steps" if eval_ds is not None else "no",
+        eval_steps=args.eval_steps if eval_ds is not None else None,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
+        load_best_model_at_end=True if eval_ds is not None else False,
+        metric_for_best_model="f1_macro" if eval_ds is not None else None,
+        warmup_ratio=args.warmup_ratio,
+        report_to="none",
     )
 
+    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    # 8) Trainer
     trainer = Trainer(
         model=model,
-        args=args_train,
-        train_dataset=dsd["train"],
-        eval_dataset=dsd["validation"],
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collator,
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
+        compute_metrics=(lambda p: compute_metrics(p, id2label)) if eval_ds is not None else None,
     )
 
-    if args.class_weights:
-        # hack léger pour injecter la loss pondérée
-        trainer.compute_loss = compute_loss_with_weights  # type: ignore
-
-    # --------- Train ----------
+    # 9) Fit
+    print(f"[INFO] Train size={len(train_ds)} | Val size={0 if eval_ds is None else len(eval_ds)} | Labels={len(label2id)}")
     trainer.train()
 
-    # --------- Save (config contient id2label/label2id) ----------
-    trainer.save_model(args.output_dir)   # model + config
-    tokenizer.save_pretrained(args.output_dir)
+    # 10) Sauvegardes finales
+    (out / "final").mkdir(parents=True, exist_ok=True)
+    trainer.save_model(str(out / "final"))  # config + model
+    tokenizer.save_pretrained(str(out / "final"))
 
-    # Sauvegarde des colonnes utilisées (pratique pour l'inf)
-    meta = {
-        "text_col": args.text_col,
-        "label_col": args.label_col,
-        "id2label": {str(k): v for k, v in id2label.items()},
-        "label2id": label2id,
-        "max_length": args.max_length,
-        "stride": args.stride,
-    }
-    with open(os.path.join(args.output_dir, "dp_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    cfg_dump = vars(args).copy()
+    cfg_dump["n_train"] = len(train_ds)
+    cfg_dump["n_val"] = 0 if eval_ds is None else len(eval_ds)
+    save_json(cfg_dump, out / "config_train.json")
 
-    print(f"[OK] Checkpoint sauvegardé dans: {args.output_dir}")
+    print(f"[OK] Entraînement terminé. Modèle + tokenizer enregistrés dans: {out / 'final'}")
+
 
 if __name__ == "__main__":
     main()
