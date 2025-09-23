@@ -184,6 +184,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bundle-path", type=Path, default=Path("assets/dp_transformer/bundle.joblib"))
     p.add_argument("--lr-C", type=float, default=1.0)
     p.add_argument("--lr-max-iter", type=int, default=200)
+    p.add_argument("--aggregate", choices=["mean", "max", "first"], default="mean",help="Stratégie d’agrégation des embeddings de chunks en un seul vecteur doc.")
+
 
     # LLM (Transformers)
     p.add_argument("--llm-model", default="mistralai/Mistral-7B-Instruct-v0.3")
