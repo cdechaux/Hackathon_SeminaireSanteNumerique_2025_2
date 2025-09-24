@@ -142,8 +142,8 @@ def main():
 
     # 3) Split "par classe" (robuste aux classes rares)
     train_df, val_df = per_class_split(df, args.label_col, args.val_frac, args.seed)
-    train_df.to_csv(out / "train.csv", index=False)
-    val_df.to_csv(out / "val.csv", index=False)
+    train_df.to_csv(out / "data/train.csv", index=False)
+    val_df.to_csv(out / "data/val.csv", index=False)
 
     # 4) Tokenizer + Datasets
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=True)

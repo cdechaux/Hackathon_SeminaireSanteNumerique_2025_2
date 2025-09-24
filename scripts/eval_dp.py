@@ -11,8 +11,8 @@ un CSV "gold" (de départ) et un CSV "pred" (de sortie du pipeline).
 
 Usage:
   python eval_dp.py \
-    --gold-csv dp_dataset.csv --gold-id code_sejour --gold-col code_dp \
-    --pred-csv pred.csv       --pred-id code_sejour --pred-col dp_predit \
+    --gold-csv data/dp_dataset.csv --gold-id code_sejour --gold-col code_dp \
+    --pred-csv data/pred.csv       --pred-id code_sejour --pred-col dp_predit \
     --average macro
 
 Options utiles:

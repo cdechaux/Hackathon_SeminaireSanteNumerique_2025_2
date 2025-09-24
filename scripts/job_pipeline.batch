@@ -1,0 +1,31 @@
+#!/bin/bash
+#SBATCH --job-name=pipeline_ssn
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1 # évite les 1080 Ti ; sinon: --gres=gpu:1 --exclude=gpu004
+#SBATCH --constraint="h100|a100|v100"
+#SBATCH -c 8
+#SBATCH --mem=40G
+#SBATCH --time=03:00:00           
+#SBATCH --output=logs/%x_%j.out
+
+
+# --- Préparation ---
+mkdir -p logs
+
+
+# Activer environnement (au choix : conda OU venv)
+# --- Option A : conda ---
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate pt_env
+
+# --- Option B : venv ---
+#python -m venv aoc-env
+#source .venv/bin/activate
+pip install -r requirements.txt
+
+# --- Lancement ---
+python scripts/run_pipeline.py \
+  --input-csv data/dp_dataset.csv \
+  --output-csv data/pred.csv \
+  --mode predict \
+  --backend llm
