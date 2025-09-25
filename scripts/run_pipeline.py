@@ -74,8 +74,9 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             lower=False,
             keep_accents=True,
         )),
-        ["docs_in"], ["docs"]
+        ["docs_in"], ["docs_norm"]
     ))
+    last_docs="docs_norm"
 
     # 2) Rewrite (optionnel)
     if args.rewrite:
@@ -88,8 +89,9 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 temperature=args.rewrite_temperature,
                 top_p=args.rewrite_top_p,
             )),
-            ["docs"], ["docs"]
+            [last_docs], ["docs_rewrite"]
         ))
+        last_docs="docs_rewrite"
     else:
         # même sans rewrite, on va utiliser text_rw = text_norm via NormalizeOp+RewriteOp?
         # Ici on laisse Chunking lire "text_rw" OU sinon "text_norm" si text_rw n'existe pas.
@@ -107,7 +109,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent
                 field_out="chunks",
             )),
-            ["docs"], ["docs"]
+            [last_docs], ["docs_chunk"]
         ))
 
         steps.append(PipelineStep(
@@ -120,12 +122,12 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 chunks_field="chunks",
                 emb_field="emb",
             )),
-            ["docs"], ["docs"]
+            ["docs_chunk"], ["docs_tr"]
         ))
 
         steps.append(PipelineStep(
             AggregateChunksOp(strategy=args.aggregate),
-            ["docs"], ["docs"]
+            ["docs_tr"], ["docs_ag"]
         ))
 
 
@@ -140,7 +142,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 gold_field="gold_dp",
                 pred_field="pred_dp",
             )),
-            ["docs"], ["docs_out"]
+            ["docs_ag"], ["docs_out"]
         ))
 
     elif args.backend == "hf_finetuned":
@@ -158,7 +160,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 aggregate=args.aggregate_hf,
                 return_proba=True,
             )),
-            ["docs"], ["docs_out"]
+            [last_docs], ["docs_out"]
         ))
 
     elif args.backend == "llm":
@@ -172,7 +174,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 field_in="text_rw",          # retombe sur text_norm si absent
                 pred_field="pred_dp",
             )),
-            ["docs"], ["docs_out"]
+            [last_docs], ["docs_out"]
         ))
     else:
         raise ValueError("backend doit être 'transformer' ou 'llm'")
@@ -202,6 +204,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", choices=["transformer", "hf_finetuned", "llm"], default="transformer")
     p.add_argument("--mode", choices=["train", "predict"], default="predict")
 
+    # Preprocessing
+    p.add_argument("--rewrite", action="store_true", help="Activer la réécriture (LLM requis si tu veux paraphraser)")
+    p.add_argument("--rewrite-llm-model", default=None)
+    p.add_argument("--rewrite-target-words", type=int, default=300)
+    p.add_argument("--rewrite-max-new-tokens", type=int, default=128)
+    p.add_argument("--rewrite-temperature", type=float, default=0.3)
+    p.add_argument("--rewrite-top-p", type=float, default=0.95)
+
+    p.add_argument("--chunk-size", type=int, default=480)
+    p.add_argument("--chunk-overlap", type=int, default=64)
+
     # Modèle encoder (transformer)
     p.add_argument("--hf-model", default="almanach/camembert-bio-base")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -214,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aggregate", choices=["mean", "max", "first"], default="mean",help="Stratégie d’agrégation des embeddings de chunks en un seul vecteur doc.")
 
     # Transformer finetune
-    p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné (pour backend=hf_finetuned)")
+    p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné")
     p.add_argument("--aggregate_hf", choices=["mean", "max", "median"], default="mean")
 
 
@@ -223,17 +236,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-max-new-tokens", type=int, default=64)
     p.add_argument("--llm-temperature", type=float, default=0.0)
     p.add_argument("--llm-top-p", type=float, default=1.0)
-
-    # Preprocessing
-    p.add_argument("--rewrite", action="store_true", help="Activer la réécriture (LLM requis si tu veux paraphraser)")
-    p.add_argument("--rewrite-llm-model", default=None)
-    p.add_argument("--rewrite-target-words", type=int, default=None)
-    p.add_argument("--rewrite-max-new-tokens", type=int, default=128)
-    p.add_argument("--rewrite-temperature", type=float, default=0.3)
-    p.add_argument("--rewrite-top-p", type=float, default=0.95)
-
-    p.add_argument("--chunk-size", type=int, default=480)
-    p.add_argument("--chunk-overlap", type=int, default=64)
 
     return p.parse_args()
 
