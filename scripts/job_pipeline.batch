@@ -26,11 +26,22 @@ conda activate pt_env
 pip install -r requirements.txt
 
 # --- Lancement ---
-python scripts/run_pipeline.py \
-  --input-csv data/dp_dataset.csv \
-  --output-csv data/pred.csv \
-  --mode predict \
-  --backend transformer \
-  --col-dp code_dp \
+#python scripts/run_pipeline.py \
+  #--input-csv data/dp_dataset.csv \
+  #--output-csv data/pred.csv \
+  #--mode predict \
+  #--backend transformer \
+  #--col-dp code_dp \
   #--rewrite \
   #--rewrite-llm-model mistralai/Mistral-7B-Instruct-v0.3
+
+python scripts/create_rewrite_dataset.py \
+  --input-csv data/dp_dataset.csv \
+  --output-csv data/dp_dataset_rw.csv \
+  --text-col text \
+  --rewrite \
+  --llm-model mistralai/Mistral-7B-Instruct-v0.3\
+  --target-words 300 \
+  --max-new-tokens 200 \
+  --temperature 0.3 \
+  --top-p 0.95

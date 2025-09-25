@@ -75,7 +75,7 @@ class NormalizeOp(Operation):
         return docs
 
 
-# --------------------------- 2) Rewrite (optionnelle) -------------------
+# --------------------------- 2) Rewrite --------------------------------
 
 @dataclass
 class RewriteConfig:

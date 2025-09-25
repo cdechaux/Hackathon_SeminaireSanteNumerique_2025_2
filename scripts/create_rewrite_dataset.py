@@ -22,6 +22,9 @@ from typing import Optional, Sequence, Dict, Any
 import numpy as np
 import pandas as pd
 
+from operations import RewriteConfig, RewriteOp
+
+
 # Dépendances HF seulement si LLM activé
 try:
     import torch
@@ -80,68 +83,6 @@ def compute_metrics(text: str) -> Dict[str, float | int]:
         "n_sections": sections_by_blanklines(text),
         "abbr_count": abbr_count(text),
     }
-
-
-# ----------------------------- Rewrite Op -----------------------------
-
-@dataclass
-class RewriteConfig:
-    enabled: bool = False
-    target_words: Optional[int] = None          # ENTIER ≈ longueur cible
-    llm_model: Optional[str] = None            # modèle HF causal (local)
-    max_new_tokens: int = 128
-    temperature: float = 0.3
-    top_p: float = 0.95
-
-class RewriteOp:
-    """
-    Réécriture simple:
-      - Si LLM fourni: paraphrase/condense en visant ~target_words (si donné)
-      - Sinon: copie le texte tel quel
-    """
-    def __init__(self, cfg: RewriteConfig):
-        self.cfg = cfg
-        self._tok = None
-        self._lm = None
-        if self.cfg.enabled and self.cfg.llm_model:
-            if AutoTokenizer is None or AutoModelForCausalLM is None:
-                raise RuntimeError("Transformers non disponible. Installez transformers/torch.")
-            self._tok = AutoTokenizer.from_pretrained(self.cfg.llm_model)
-            self._lm = AutoModelForCausalLM.from_pretrained(self.cfg.llm_model, device_map="auto")
-            self._lm.eval()
-
-    @torch.no_grad() if torch else (lambda f: f)
-    def _rewrite_with_llm(self, text: str) -> str:
-        if not text:
-            return ""
-        assert self._tok and self._lm
-        target = f"\nLongueur cible: ~{self.cfg.target_words} mots." if self.cfg.target_words else ""
-        prompt = (
-            "Réécris et résume le compte rendu hospitalier ci-dessous en gardant le sens clinique, "
-            "en français clair, sans inventer d'informations, en visant l’extraction du diagnostic principal."
-            f"{target}\n\nTexte:\n{ text.strip() }"
-        )
-        tok = self._tok(prompt, return_tensors="pt", truncation=True, max_length=4096)
-        tok = {k: v.to(self._lm.device) for k, v in tok.items()}
-        out = self._lm.generate(
-            **tok,
-            do_sample=True,
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
-            max_new_tokens=self.cfg.max_new_tokens,
-            pad_token_id=self._tok.eos_token_id,
-        )
-        gen = self._tok.decode(out[0], skip_special_tokens=True)
-        # Si le modèle recopie le prompt, on ne garde que la partie après "Texte:"
-        parts = gen.split("Texte:")
-        rewritten = parts[-1].strip() if parts else gen.strip()
-        return rewritten
-
-    def run_one(self, text: str) -> str:
-        base = text or ""
-        if self.cfg.enabled and self._lm is not None:
-            return self._rewrite_with_llm(base)
-        return base
 
 
 # ----------------------------- Main -----------------------------
