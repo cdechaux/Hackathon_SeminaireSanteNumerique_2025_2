@@ -1,187 +1,149 @@
 #!/usr/bin/env python3
 # create_rewrite_dataset.py
-"""
-Réécrit un dataset de comptes rendus + calcule des métriques avant/après.
-- Optionnel: réécriture via un modèle Causal LM (HF Transformers) local.
-- target_words: ENTIER (≈ nombre de mots visés), ou None pour désactiver la contrainte.
-- Sections détectées par blocs séparés par >= 2 retours ligne.
-- Abréviations approximées: mots en MAJ >=2 lettres OU formes A.B.C.
-- Sorties:
-  * CSV: colonnes originales + text_rewritten + métriques _before/_after
-  * JSON: moyennes globales et configuration (incluant target_words)
-"""
-
 from __future__ import annotations
-import argparse
-import json
-import re
-from dataclasses import dataclass
+import argparse, json
 from pathlib import Path
-from typing import Optional, Sequence, Dict, Any
-
-import numpy as np
+from typing import Dict, Any
 import pandas as pd
+from medkit.core.pipeline import Pipeline, PipelineStep
+from medkit.core.text import TextDocument
 
-from operations import RewriteConfig, RewriteOp
+# importe tes opérations
+from operations import RewriteOp, RewriteConfig, MetricsTextOp, MetricsTextConfig
 
+METRIC_KEYS = ["len_chars", "len_words", "sent_len_avg", "lexicon_size", "n_sections", "n_abbr"]
 
-# Dépendances HF seulement si LLM activé
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-except Exception:
-    torch = None
-    AutoTokenizer = None
-    AutoModelForCausalLM = None
+def save_json(obj: Dict[str, Any], path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-
-# ----------------------------- Métriques -----------------------------
-
-_RE_TOKEN = re.compile(r"\b\w+\b", flags=re.UNICODE)
-_RE_SENT_SPLIT = re.compile(r"[\.!?]+|\n+", flags=re.UNICODE)  # phrases grossières
-_RE_ABBR = re.compile(r"\b([A-Z]{2,}|(?:[A-Za-z]\.){2,})\b")  # MAJUSCULES ou A.B.C
-
-def sections_by_blanklines(text: str) -> int:
-    """Nombre de sections = blocs séparés par >= 2 sauts de ligne."""
-    if not text:
-        return 0
-    blocks = [b for b in re.split(r"\n{2,}", text.strip()) if b.strip()]
-    return len(blocks)
-
-def simple_tokens(text: str):
-    return _RE_TOKEN.findall(text.lower()) if text else []
-
-def vocab_size(text: str) -> int:
-    toks = simple_tokens(text)
-    return len(set(toks))
-
-def len_chars(text: str) -> int:
-    return len(text or "")
-
-def len_words(text: str) -> int:
-    return len(simple_tokens(text))
-
-def mean_sentence_len_words(text: str) -> float:
-    if not text:
-        return 0.0
-    # split grossier en phrases
-    parts = [p.strip() for p in _RE_SENT_SPLIT.split(text) if p.strip()]
-    if not parts:
-        return 0.0
-    lens = [len(simple_tokens(p)) for p in parts if p]
-    return float(np.mean(lens)) if lens else 0.0
-
-def abbr_count(text: str) -> int:
-    return len(_RE_ABBR.findall(text or ""))
-
-def compute_metrics(text: str) -> Dict[str, float | int]:
-    return {
-        "len_chars": len_chars(text),
-        "len_words": len_words(text),
-        "mean_sent_len_words": round(mean_sentence_len_words(text), 4),
-        "vocab_size": vocab_size(text),
-        "n_sections": sections_by_blanklines(text),
-        "abbr_count": abbr_count(text),
-    }
-
-
-# ----------------------------- Main -----------------------------
+def build_pipeline(args) -> Pipeline:
+    steps = []
+    # Metrics BEFORE
+    steps.append(PipelineStep(
+        MetricsTextOp(MetricsTextConfig(
+            text_field=args.text_col,   # lit directement la colonne d'entrée
+            metrics_root="metrics",
+            phase="before"
+        )),
+        ["docs"], ["docs"]
+    ))
+    # Rewrite
+    steps.append(PipelineStep(
+        RewriteOp(RewriteConfig(
+            enabled=True,
+            target_words=args.target_words,
+            llm_model=args.llm_model,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )),
+        ["docs"], ["docs"]
+    ))
+    # Metrics AFTER (sur text_rw)
+    steps.append(PipelineStep(
+        MetricsTextOp(MetricsTextConfig(
+            text_field="text_rw",
+            metrics_root="metrics",
+            phase="after"
+        )),
+        ["docs"], ["docs_out"]
+    ))
+    return Pipeline(steps=steps, input_keys=["docs"], output_keys=["docs_out"], name="rewrite_metrics")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-csv", required=True, help="CSV d’entrée")
-    ap.add_argument("--output-csv", required=True, help="CSV de sortie réécrit + métriques")
-    ap.add_argument("--summary-json", required=False, default=None,
-                    help="Chemin JSON récapitulatif (moyennes + config). Par défaut: <output-csv>.json")
-    ap.add_argument("--text-col", default="text", help="Nom de la colonne texte d’entrée")
-    ap.add_argument("--rewrite", action="store_true", help="Activer la réécriture LLM")
-    ap.add_argument("--llm-model", default=None, help="Modèle causal HF (local), ex: 'mistral-small' (gguf converti), 'NousResearch/Meta-Llama-3-8B-Instruct' (si dispo local)")
-    ap.add_argument("--target-words", type=int, default=None, help="Nombre de mots visés (~). Laisse vide pour désactiver.")
-    ap.add_argument("--max-new-tokens", type=int, default=128)
+    ap.add_argument("--input-csv", required=True)
+    ap.add_argument("--output-csv", required=True)
+    ap.add_argument("--text-col", default="text")
+    ap.add_argument("--out-text-col", default="text_rw")  # nom de colonne du texte réécrit dans le CSV de sortie
+
+    # Rewrite params
+    ap.add_argument("--llm-model", required=True, help="Modèle HF causal (ex: mistralai/Mistral-7B-Instruct-v0.3)")
+    ap.add_argument("--target-words", type=int, default=None)
+    ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.3)
-    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top_p", type=float, default=0.95)
+
+    # Fichiers de métriques
+    ap.add_argument("--metrics-json", default=None, help="Chemin du JSON récapitulatif (default: <output>.metrics.json)")
     args = ap.parse_args()
 
-    in_path = Path(args.input_csv)
-    out_path = Path(args.output_csv)
-    sum_path = Path(args.summary_json) if args.summary_json else out_path.with_suffix(out_path.suffix + ".json")
+    inp = Path(args.input_csv)
+    out_csv = Path(args.output_csv)
+    metrics_json = Path(args.metrics_json) if args.metrics_json else out_csv.with_suffix(".metrics.json")
 
-    df = pd.read_csv(in_path)
-    if args.text_col not in df.columns:
-        raise ValueError(f"Colonne '{args.text_col}' absente du CSV.")
+    df = pd.read_csv(inp)
+    assert args.text_col in df.columns, f"Colonne '{args.text_col}' absente de {inp}"
 
-    # Config + Op
-    cfg = RewriteConfig(
-        enabled=bool(args.rewrite),
-        target_words=args.target_words,
-        llm_model=args.llm_model,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
-    op = RewriteOp(cfg)
-
-    # Colonnes métriques à ajouter
-    metrics_names = ["len_chars", "len_words", "mean_sent_len_words", "vocab_size", "n_sections", "abbr_count"]
-    for m in metrics_names:
-        df[f"{m}_before"] = np.nan
-        df[f"{m}_after"] = np.nan
-
-    # Réécriture + métriques
-    rewritten_texts = []
+    # Construire docs
+    docs = []
     for i, row in df.iterrows():
-        txt = str(row.get(args.text_col, "") or "")
+        txt = str(row[args.text_col]) if pd.notna(row[args.text_col]) else ""
+        d = TextDocument(text=txt)
+        # pour Metrics(before), on veut lire text_col depuis metadata (sinon il lira d.text)
+        d.metadata[args.text_col] = txt
+        docs.append(d)
 
-        m_before = compute_metrics(txt)
-        for k, v in m_before.items():
-            df.at[i, f"{k}_before"] = v
+    # Pipeline
+    pipe = build_pipeline(args)
+    docs = pipe.run(docs)
 
-        txt_rw = op.run_one(txt)
-        rewritten_texts.append(txt_rw)
+    # Construire nouveau DataFrame
+    out_rows = []
+    agg_before = {k: 0.0 for k in METRIC_KEYS}
+    agg_after  = {k: 0.0 for k in METRIC_KEYS}
 
-        m_after = compute_metrics(txt_rw)
-        for k, v in m_after.items():
-            df.at[i, f"{k}_after"] = v
+    for src_row, d in zip(df.to_dict("records"), docs):
+        metrics = d.metadata.get("metrics", {})
+        before = metrics.get("before", {})
+        after  = metrics.get("after", {})
+        rw_txt = d.metadata.get("text_rw", d.text)
 
-    df["text_rewritten"] = rewritten_texts
+        row = dict(src_row)  # conserve toutes les colonnes originelles
+        row[args.out_text_col] = rw_txt
 
-    # Sauvegarde CSV
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_path, index=False)
+        # Ajoute colonnes métriques _before/_after
+        for k in METRIC_KEYS:
+            row[f"{k}_before"] = before.get(k, None)
+            row[f"{k}_after"]  = after.get(k, None)
+            if before.get(k) is not None:
+                agg_before[k] += float(before[k])
+            if after.get(k) is not None:
+                agg_after[k] += float(after[k])
 
-    # Moyennes globales
-    means = {}
-    for m in metrics_names:
-        means[f"{m}_before_mean"] = float(np.nanmean(df[f"{m}_before"].astype(float)))
-        means[f"{m}_after_mean"]  = float(np.nanmean(df[f"{m}_after"].astype(float)))
+        out_rows.append(row)
 
-    # Impression console
-    print("\n--- Moyennes globales (avant/après) ---")
-    for m in metrics_names:
-        print(f"{m:>20}: before={means[f'{m}_before_mean']:.3f} | after={means[f'{m}_after_mean']:.3f}")
+    out_df = pd.DataFrame(out_rows)
+    out_df.to_csv(out_csv, index=False)
 
-    # JSON résumé (inclut target_words & config)
-    summary: Dict[str, Any] = {
-        "n_rows": int(len(df)),
-        "config": {
-            "rewrite_enabled": cfg.enabled,
-            "llm_model": cfg.llm_model,
-            "target_words": cfg.target_words,     # ENTIER ou None
-            "max_new_tokens": cfg.max_new_tokens,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "section_rule": "sections = blocs séparés par >= 2 sauts de ligne",
-            "abbr_rule": "mots MAJ >=2 lettres ou formes A.B.C détectées par regex",
+    n = len(out_rows) if out_rows else 1
+    means_before = {k: round(agg_before[k] / n, 3) for k in METRIC_KEYS}
+    means_after  = {k: round(agg_after[k] / n, 3) for k in METRIC_KEYS}
+
+    recap = {
+        "input_csv": str(inp),
+        "output_csv": str(out_csv),
+        "n_rows": len(out_rows),
+        "rewrite": {
+            "llm_model": args.llm_model,
+            "target_words": args.target_words,
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
         },
-        "metrics_means": means,
+        "metrics_means": {
+            "before": means_before,
+            "after": means_after,
+        }
     }
-    sum_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(sum_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    save_json(recap, metrics_json)
 
-    print(f"\n[OK] Écrit: {out_path}")
-    print(f"[OK] Résumé: {sum_path}")
-
+    print(f"[OK] Nouveau dataset écrit: {out_csv}")
+    print(f"[OK] Récap métriques: {metrics_json}")
+    print("Moyennes BEFORE:", means_before)
+    print("Moyennes AFTER :", means_after)
 
 if __name__ == "__main__":
     main()

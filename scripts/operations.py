@@ -14,12 +14,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence, Optional, Dict, Any, Tuple
 import os
-import re
+import regex as re
 import json
 import time
 import joblib
 import numpy as np
 import torch
+import unicodedata
 
 from sklearn.linear_model import LogisticRegression
 
@@ -35,6 +36,30 @@ ICD10_REGEX = re.compile(r"\b[A-TV-Z][0-9]{2}(?:\.[0-9A-TV-Z]{0,4})?\b")
 def first_icd10(text: str) -> Optional[str]:
     m = ICD10_REGEX.search(text or "")
     return m.group(0) if m else None
+
+
+_RE_WORD = re.compile(r"\b[\p{L}\p{N}][\p{L}\p{N}\-_/]*\b", re.UNICODE)
+_RE_UPPER_ABBR = re.compile(r"\b[A-ZÀ-Ý0-9]{2,}\b")
+_RE_ABBR_DOTTED = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?\b")
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+def _tokenize_words(text: str) -> list[str]:
+    return _RE_WORD.findall(text)
+
+def _split_sentences(text: str) -> list[str]:
+    # split grossière par ponctuation forte + sauts de ligne
+    return [s.strip() for s in re.split(r"[\.!?;\n]+", text) if s.strip()]
+
+def _count_sections_by_blanklines(text: str) -> int:
+    # sections = blocs séparés par ≥2 sauts de ligne
+    blocks = [b for b in re.split(r"\n{2,}", text) if b.strip()]
+    return len(blocks)
+
+def _count_abbr(text: str) -> int:
+    return len(_RE_UPPER_ABBR.findall(text)) + len(_RE_ABBR_DOTTED.findall(text))
+
 
 
 # --------------------------- 1) Normalize -------------------------------
@@ -76,6 +101,68 @@ class NormalizeOp(Operation):
 
 
 # --------------------------- 2) Rewrite --------------------------------
+
+
+@dataclass
+class MetricsTextConfig:
+    text_field: str = "text"          # clé de lecture du texte
+    metrics_root: str = "metrics"     # ou ecrire les metriques, ex :d.metadata["metrics"][phase] = {...}
+    phase: str = "before"             # "before" | "after"
+    lowercase: bool = True
+    remove_accents: bool = True
+
+class MetricsTextOp(Operation):
+    """Calcule des métriques de texte et les écrit dans d.metadata['metrics'][phase]."""
+    def __init__(self, cfg: MetricsTextConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    def _normalize_for_vocab(self, tokens: list[str]) -> list[str]:
+        out = tokens
+        if self.cfg.lowercase:
+            out = [t.lower() for t in out]
+        if self.cfg.remove_accents:
+            out = [_strip_accents(t) for t in out]
+        return out
+
+    def _compute(self, text: str) -> Dict[str, float]:
+        if not text:
+            return {
+                "len_chars": 0,
+                "len_words": 0,
+                "sent_len_avg": 0.0,
+                "lexicon_size": 0,
+                "n_sections": 0,
+                "n_abbr": 0,
+            }
+        words = _tokenize_words(text)
+        sents = _split_sentences(text)
+        norm_words = self._normalize_for_vocab(words)
+
+        len_chars = len(text)
+        len_words = len(words)
+        sent_len_avg = (sum(len(_tokenize_words(s)) for s in sents) / len(sents)) if sents else 0.0
+        lexicon_size = len(set(norm_words))
+        n_sections = _count_sections_by_blanklines(text)
+        n_abbr = _count_abbr(text)
+
+        return {
+            "len_chars": int(len_chars),
+            "len_words": int(len_words),
+            "sent_len_avg": float(round(sent_len_avg, 3)),
+            "lexicon_size": int(lexicon_size),
+            "n_sections": int(n_sections),
+            "n_abbr": int(n_abbr),
+        }
+
+    def run(self, docs: Sequence[TextDocument]):
+        for d in docs:
+            text = d.metadata.get(self.cfg.text_field, d.text or "")
+            stats = self._compute(text)
+            d.metadata.setdefault(self.cfg.metrics_root, {})
+            d.metadata[self.cfg.metrics_root][self.cfg.phase] = stats
+        return list(docs)
+
 
 @dataclass
 class RewriteConfig:

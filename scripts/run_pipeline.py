@@ -16,6 +16,7 @@ from medkit.core.text import TextDocument
 
 from operations import (
     NormalizeConfig, NormalizeOp,
+    MetricsTextOp, MetricsTextConfig,
     RewriteConfig, RewriteOp,
     ChunkingConfig, ChunkingOp, AggregateChunksOp,
     EmbedConfig, TransformerEmbedOp,
@@ -65,21 +66,37 @@ def write_preds_to_csv(docs: List[TextDocument], out_csv: Path, out_col_sejour: 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
     steps: List[PipelineStep] = []
 
+    last_docs="docs_in"
+
     # 1) Normalisation
-    steps.append(PipelineStep(
-        NormalizeOp(NormalizeConfig(
-            strip=True,
-            collapse_spaces=True,
-            normalize_newlines=True,
-            lower=False,
-            keep_accents=True,
-        )),
-        ["docs_in"], ["docs_norm"]
-    ))
-    last_docs="docs_norm"
+    if args.normalisation :
+        steps.append(PipelineStep(
+            NormalizeOp(NormalizeConfig(
+                strip=True,
+                collapse_spaces=True,
+                normalize_newlines=True,
+                lower=False,
+                keep_accents=True,
+            )),
+            [last_docs], ["docs_norm"]
+        ))
+        last_docs="docs_norm"
 
     # 2) Rewrite (optionnel)
-    if args.rewrite:
+    # --- Metrics BEFORE (si demandé)
+    if args.rewrite and args.with_metrics:      # attention si normalisation effectuée avant : biais dans le calcul des metriques "initiales"
+        steps.append(PipelineStep(
+            MetricsTextOp(MetricsTextConfig(
+                text_field=args.col_text,      # ou "text_norm" si on veut travailler sur le texte normalisé à une précédente étape
+                metrics_root="metrics",
+                phase="before"
+            )),
+            [last_docs], ["docs_rw_b"]
+        ))
+        last_docs ="docs_rw_b"
+
+    # --- Rewrite
+    if args.rewrite:                                   
         steps.append(PipelineStep(
             RewriteOp(RewriteConfig(
                 enabled=True,
@@ -89,16 +106,26 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 temperature=args.rewrite_temperature,
                 top_p=args.rewrite_top_p,
             )),
-            [last_docs], ["docs_rewrite"]
+            [last_docs], ["docs_rw"]
         ))
-        last_docs="docs_rewrite"
+        last_docs ="docs_rw"
+
+    # --- Metrics AFTER (si demandé)
+    if args.rewrite and args.with_metrics:
+        steps.append(PipelineStep(
+            MetricsTextOp(MetricsTextConfig(
+                text_field="text_rw",
+                metrics_root="metrics",
+                phase="after"
+            )),
+            [last_docs], ["docs_rw_a"]
+        ))
+        last_docs ="docs_rw_a"
+
+
     else:
-        # même sans rewrite, on va utiliser text_rw = text_norm via NormalizeOp+RewriteOp?
-        # Ici on laisse Chunking lire "text_rw" OU sinon "text_norm" si text_rw n'existe pas.
         pass
 
-    # 3) Chunking
-    
     # 4) Embeddings (pour backend=transformer)
     if args.backend == "transformer":
         steps.append(PipelineStep(
@@ -205,6 +232,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["train", "predict"], default="predict")
 
     # Preprocessing
+    p.add_argument("--normalisation", action="store_true", help="Activer la normalisation du texte en entrée de pipeline")
+    p.add_argument("--with-metrics", action="store_true", help="Calcule les métriques BEFORE/AFTER autour de la réécriture et les ajoute au CSV de sortie.")
     p.add_argument("--rewrite", action="store_true", help="Activer la réécriture (LLM requis si tu veux paraphraser)")
     p.add_argument("--rewrite-llm-model", default=None)
     p.add_argument("--rewrite-target-words", type=int, default=300)
@@ -264,9 +293,58 @@ def main():
     # Exécuter
     docs_out = pipe.run(docs)
 
-    # Écrire résultats
+        # Écrire résultats (+ métriques si demandé)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    write_preds_to_csv(docs_out, args.output_csv, args.out_col_sejour, args.out_col_pred)
+
+    use_metrics = getattr(args, "with_metrics", False) and getattr(args, "rewrite", False)
+
+    if not use_metrics:
+        # Chemin classique
+        write_preds_to_csv(docs_out, args.output_csv, args.out_col_sejour, args.out_col_pred)
+    else:
+        # ---- Construction CSV avec métriques ----
+        import pandas as pd
+
+        def _metrics_keys(d):
+            mb = d.metadata.get("metrics_before") or {}
+            ma = d.metadata.get("metrics_after") or {}
+            return sorted(set(mb.keys()) | set(ma.keys()))
+
+        
+
+        # Récupère l’ensemble des clés de métriques présentes dans tout le lot
+        all_keys = set()
+        for d in docs_out:
+            all_keys.update(_metrics_keys(d))
+        all_keys = sorted(all_keys)
+
+        rows = []
+        for d in docs_out:
+            row = {
+                args.out_col_sejour: d.metadata.get("code_sejour"),
+                args.out_col_pred: pred_dp.strip() or "",
+            }
+            mb = d.metadata.get("metrics_before") or {}
+            ma = d.metadata.get("metrics_after") or {}
+            for k in all_keys:
+                row[f"{k}_before"] = mb.get(k)
+                row[f"{k}_after"]  = ma.get(k)
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.to_csv(args.output_csv, index=False)
+
+        # ---- Affichage des moyennes globales ----
+        # On calcule la moyenne colonne par colonne uniquement pour les colonnes numériques
+        numeric_cols = [c for c in df.columns if c.endswith("_before") or c.endswith("_after")]
+        means = df[numeric_cols].mean(numeric_only=True)
+
+        print("\n[MÉTRIQUES — moyennes globales]")
+        for k in all_keys:
+            b_col, a_col = f"{k}_before", f"{k}_after"
+            b_mean = means.get(b_col, float("nan"))
+            a_mean = means.get(a_col, float("nan"))
+            print(f"  - {k:20s}  before={b_mean:.3f}  |  after={a_mean:.3f}")
 
     # Affichage bref
     n_pred = sum(1 for d in docs_out if d.metadata.get("pred_dp"))

@@ -3,3 +3,4 @@ assets/
 aoc-env/
 data/
 logs/
+__pycache__/

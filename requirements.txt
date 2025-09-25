@@ -13,6 +13,9 @@ safetensors>=0.4,<1.0
 tokenizers>=0.15,<0.20
 sentencepiece>=0.1.99    
 datasets
+protobuf
+regex>=2024.5.15
+
 
 # --- Medkit (pipeline, documents, opérations) ---
 medkit-lib>=0.17.0
