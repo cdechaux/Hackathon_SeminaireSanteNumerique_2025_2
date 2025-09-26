@@ -1,12 +1,26 @@
-#!/usr/bin/env python3
-# train_finetune_dp.py
 """
-Fine-tuning DP (single-label) avec Transformers + Trainer custom (poids de classes).
-- Modèle HF standard (AutoModelForSequenceClassification) => save_pretrained OK
-- Pondération des classes dans `compute_loss()`
-- Split "par classe" robuste (évite l'erreur de stratification quand classe rare)
-- Sauvegarde: checkpoints/, final/ (config.json, model.safetensors, tokenizer*), label_map.json
+train_finetune_dp.py — Fine-tuning multiclasses (DP) avec Transformers
+
+But
+----
+Fine-tuner un modèle HF (ex. CamemBERT-bio) en classification de séquence sur un CSV
+texte/label. Gère classes rares via split “par classe” et applique des poids
+de classes dans la loss (CrossEntropy).
+
+Entrée / Sortie
+---------------
+Entrée : --input-csv avec colonnes --text-col et --label-col
+Sorties : dossier --output-dir contenant final/ (config.json, model.safetensors,
+tokenizer*), label_map.json, data/train.csv & data/val.csv, split_stats.json.
+
+Points clés
+-----------
+- Split robuste par classe (évite l’échec stratify quand n=1)
+- Class weights = inv. fréquence (calculés sur le train)
+- Trainer HF standard (args: epochs, batch-size, lr, fp16/bf16, warmup, etc.)
 """
+
+
 
 from __future__ import annotations
 import argparse, json, math, os, random
@@ -134,7 +148,7 @@ def main():
     assert args.text_col in df.columns and args.label_col in df.columns, "Cols manquantes dans le CSV"
     df = df[[args.text_col, args.label_col]].dropna().reset_index(drop=True)
 
-    # 2) Label map (fixe, pour reproducibilité)
+    # 2) Label map (fixe)
     labels_sorted = sorted(df[args.label_col].astype(str).unique().tolist())
     label2id = {lab: i for i, lab in enumerate(labels_sorted)}
     id2label = {i: lab for lab, i in label2id.items()}
@@ -142,6 +156,7 @@ def main():
 
     # 3) Split "par classe" (robuste aux classes rares)
     train_df, val_df = per_class_split(df, args.label_col, args.val_frac, args.seed)
+    (out / "data").mkdir(parents=True, exist_ok=True)
     train_df.to_csv(out / "data/train.csv", index=False)
     val_df.to_csv(out / "data/val.csv", index=False)
 

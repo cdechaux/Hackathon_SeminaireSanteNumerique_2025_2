@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-# eval_dp.py
 """
-Évalue des prédictions de DP (un seul code par séjour) en comparant
+Évalue des prédictions de Diagnostic Principal (DP) (un seul code par séjour) en comparant
 un CSV "gold" (de départ) et un CSV "pred" (de sortie du pipeline).
 
 - Jointure sur un identifiant commun (ex: code_sejour).
@@ -66,7 +64,7 @@ def main():
         print(f"[ERR] Impossible de lire les CSV: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Conserver uniquement colonnes utiles
+    # Conserver uniquement les colonnes utiles
     miss_g = [c for c in [args.gold_id, args.gold_col] if c not in df_g.columns]
     miss_p = [c for c in [args.pred_id, args.pred_col] if c not in df_p.columns]
     if miss_g:
@@ -93,7 +91,7 @@ def main():
         print("[ERR] Aucune ligne commune après jointure sur l'ID.", file=sys.stderr)
         sys.exit(1)
 
-    # Filtrer lignes valides (codes non vides)
+    # Filtrer les lignes valides (codes non vides)
     merged = merged[(merged["_dp_gold"].astype(str).str.len() > 0) &
                     (merged["_dp_pred"].astype(str).str.len() > 0)]
 
@@ -104,7 +102,7 @@ def main():
     y_true = merged["_dp_gold"].tolist()
     y_pred = merged["_dp_pred"].tolist()
 
-    # Métriques
+    # Calcul des métriques
     prec, rec, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average=args.average, zero_division=0
     )

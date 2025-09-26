@@ -1,5 +1,23 @@
-#!/usr/bin/env python3
-# create_rewrite_dataset.py
+"""
+Script de réécriture de comptes rendus hospitaliers avec calcul de métriques.
+- Lit un CSV contenant des textes (colonne configurable).
+- Applique une étape de réécriture avec un modèle de langage (HF causal LM).
+- Calcule plusieurs métriques avant et après réécriture :
+    * longueur en caractères
+    * longueur en mots
+    * longueur moyenne des phrases
+    * taille du dictionnaire (lexique après lemmatisation)
+    * nombre de sections (≈ sauts de lignes doubles)
+    * nombre d’abréviations/acronymes
+- Sauvegarde un nouveau CSV contenant :
+    * les colonnes d’origine
+    * une colonne avec le texte réécrit
+    * deux colonnes par métrique (_before / _after)
+- Produit aussi un fichier JSON récapitulatif avec :
+    * paramètres de réécriture (modèle, température, etc.)
+    * moyennes globales des métriques avant/après
+"""
+
 from __future__ import annotations
 import argparse, json
 from pathlib import Path
@@ -8,7 +26,7 @@ import pandas as pd
 from medkit.core.pipeline import Pipeline, PipelineStep
 from medkit.core.text import TextDocument
 
-# importe tes opérations
+# import des opérations Medkit
 from operations import RewriteOp, RewriteConfig, MetricsTextOp, MetricsTextConfig
 
 METRIC_KEYS = ["len_chars", "len_words", "sent_len_avg", "lexicon_size", "n_sections", "n_abbr"]
@@ -20,16 +38,16 @@ def save_json(obj: Dict[str, Any], path: Path):
 
 def build_pipeline(args) -> Pipeline:
     steps = []
-    # Metrics BEFORE
+    # Calcul des metriques de texte avant reecriture
     steps.append(PipelineStep(
         MetricsTextOp(MetricsTextConfig(
-            text_field=args.text_col,   # lit directement la colonne d'entrée
+            text_field=args.text_col,   
             metrics_root="metrics",
             phase="before"
         )),
         ["docs"], ["docs_b"]
     ))
-    # Rewrite
+    # Reecriture
     steps.append(PipelineStep(
         RewriteOp(RewriteConfig(
             enabled=True,
@@ -41,7 +59,7 @@ def build_pipeline(args) -> Pipeline:
         )),
         ["docs_b"], ["docs_r"]
     ))
-    # Metrics AFTER (sur text_rw)
+    # Calcul des metriques de texte apres reecriture
     steps.append(PipelineStep(
         MetricsTextOp(MetricsTextConfig(
             text_field="text_rw",
@@ -59,14 +77,14 @@ def main():
     ap.add_argument("--text-col", default="text")
     ap.add_argument("--out-text-col", default="text_rw")  # nom de colonne du texte réécrit dans le CSV de sortie
 
-    # Rewrite params
+    # Parametres de reecriture
     ap.add_argument("--llm-model", required=True, help="Modèle HF causal (ex: mistralai/Mistral-7B-Instruct-v0.3)")
     ap.add_argument("--target-words", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.3)
     ap.add_argument("--top_p", type=float, default=0.95)
 
-    # Fichiers de métriques
+    # Fichier de métriques
     ap.add_argument("--metrics-json", default=None, help="Chemin du JSON récapitulatif (default: <output>.metrics.json)")
     args = ap.parse_args()
 
@@ -77,20 +95,19 @@ def main():
     df = pd.read_csv(inp)
     assert args.text_col in df.columns, f"Colonne '{args.text_col}' absente de {inp}"
 
-    # Construire docs
+    # Construire les documents
     docs = []
     for i, row in df.iterrows():
         txt = str(row[args.text_col]) if pd.notna(row[args.text_col]) else ""
         d = TextDocument(text=txt)
-        # pour Metrics(before), on veut lire text_col depuis metadata (sinon il lira d.text)
         d.metadata[args.text_col] = txt
         docs.append(d)
 
-    # Pipeline
+    # Pipeline de reecriture
     pipe = build_pipeline(args)
     docs = pipe.run(docs)
 
-    # Construire nouveau DataFrame
+    # Construire nouveau csv de sortie
     out_rows = []
     agg_before = {k: 0.0 for k in METRIC_KEYS}
     agg_after  = {k: 0.0 for k in METRIC_KEYS}
@@ -101,10 +118,10 @@ def main():
         after  = metrics.get("after", {})
         rw_txt = d.metadata.get("text_rw", d.text)
 
-        row = dict(src_row)  # conserve toutes les colonnes originelles
+        row = dict(src_row) 
         row[args.out_text_col] = rw_txt
 
-        # Ajoute colonnes métriques _before/_after
+        # Ajout des colonnes de métriques _before/_after reecriture
         for k in METRIC_KEYS:
             row[f"{k}_before"] = before.get(k, None)
             row[f"{k}_after"]  = after.get(k, None)

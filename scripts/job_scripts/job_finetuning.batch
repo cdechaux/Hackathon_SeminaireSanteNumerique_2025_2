@@ -1,0 +1,37 @@
+#!/bin/bash
+#SBATCH --job-name=finetuning_ssn
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1 # évite les 1080 Ti ; sinon: --gres=gpu:1 --exclude=gpu004
+
+#SBATCH -c 8
+#SBATCH --mem=40G
+#SBATCH --time=03:00:00           
+#SBATCH --output=logs/%x_%j.out
+
+
+# --- Préparation ---
+mkdir -p logs
+
+
+# Activer environnement
+# --- Option A : conda ---
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate pt_env
+
+# --- Option B : venv ---
+#python -m venv aoc-env
+#source .venv/bin/activate
+
+
+pip install -r requirements.txt
+
+# --- Lancement ---
+# attention a bien adapter --text-col si on veut finetuner sur les textes reecrits
+python scripts/train_finetune_dp.py \
+  --input-csv data/dp_dataset_rw.csv \
+  --text-col text_rw \
+  --label-col code_dp \
+  --output-dir checkpoints/camembert_dp_ft_2 \
+  --pretrained almanach/camembert-bio-base \
+  --epochs 3 --batch-size 8 --lr 2e-5 --fp16
+

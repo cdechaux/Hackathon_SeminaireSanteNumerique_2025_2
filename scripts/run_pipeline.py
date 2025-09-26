@@ -1,9 +1,41 @@
-#!/usr/bin/env python3
-# run_pipeline.py
-# Pipeline medkit complet (DP uniquement) avec backend Transformers :
-#  - Normalize → (Rewrite?) → Chunk → Embed → (TransformerDPHeadOp | LLMDPInferenceOp)
-# Entrée : CSV avec colonnes configurables (code, text, code_patient, code_sejour)
-# Sortie : CSV minimal (code_sejour, dp_predit) avec noms de colonnes configurables.
+"""
+run_pipeline.py — Pipeline modulaire de prédiction du Diagnostic Principal (DP)
+
+But
+----
+Chaîner différentes opérations NLP Medkit (normalisation, réécriture, chunking, embeddings,
+classification ...) pour entraîner ou inférer des codes DP à partir de comptes rendus
+hospitaliers. 
+
+Entrée / Sortie
+---------------
+- Entrée : CSV avec colonnes configurables (texte, DP gold, id patient/séjour)
+- Sortie : CSV avec au minimum (code_sejour, dp_predit).
+  Optionnellement : métriques BEFORE/AFTER si --rewrite + --with-metrics.
+
+Backends
+--------
+- transformer    : embeddings HF gelé + tête LogReg (train/predict)
+- hf_finetuned   : modèle HF fine-tuné (sequence classification)
+- llm            : inférence DP par génération + extraction CIM-10
+
+Options clés
+------------
+--normalisation        Activer nettoyage du texte
+--rewrite              Réécriture par LLM (avec métriques possibles)
+--chunk-size/overlap   Contrôle des fenêtres pour embeddings
+--bundle-path          Sauvegarde/chargement de la tête LogReg
+--hf-checkpoint        Dossier checkpoint d’un modèle HF fine-tuné
+--llm-model            Modèle causal pour inférence directe
+
+Exemples
+--------
+# Entraînement tête LogReg
+python run_pipeline.py --backend transformer --mode train --input-csv data/train.csv --col-dp code_dp
+
+# Inférence LLM avec réécriture + métriques
+python run_pipeline.py --backend llm --rewrite --with-metrics --input-csv data/dev.csv
+"""
 
 from __future__ import annotations
 import argparse
@@ -61,14 +93,14 @@ def write_preds_to_csv(docs: List[TextDocument], out_csv: Path, out_col_sejour: 
         w.writerows(rows)
 
 
-# ----------------------- Pipeline builder -----------------------
+# ----------------------- Construction du pipeline -----------------------
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
     steps: List[PipelineStep] = []
 
     last_docs="docs_in"
 
-    # 1) Normalisation
+    # Normalisation
     if args.normalisation :
         steps.append(PipelineStep(
             NormalizeOp(NormalizeConfig(
@@ -82,9 +114,9 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         ))
         last_docs="docs_norm"
 
-    # 2) Rewrite (optionnel)
-    # --- Metrics BEFORE (si demandé)
-    if args.rewrite and args.with_metrics:      # attention si normalisation effectuée avant : biais dans le calcul des metriques "initiales"
+    # Reecriture via LLM
+    # --- Calcul des metriques de texte avant reecriture
+    if args.rewrite and args.with_metrics:    
         steps.append(PipelineStep(
             MetricsTextOp(MetricsTextConfig(
                 text_field=args.col_text,      # ou "text_norm" si on veut travailler sur le texte normalisé à une précédente étape
@@ -95,7 +127,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         ))
         last_docs ="docs_rw_b"
 
-    # --- Rewrite
+    # --- Reecriture
     if args.rewrite:                                   
         steps.append(PipelineStep(
             RewriteOp(RewriteConfig(
@@ -110,7 +142,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         ))
         last_docs ="docs_rw"
 
-    # --- Metrics AFTER (si demandé)
+    # --- Calcul des metriques de texte apres reecriture
     if args.rewrite and args.with_metrics:
         steps.append(PipelineStep(
             MetricsTextOp(MetricsTextConfig(
@@ -126,19 +158,20 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
     else:
         pass
 
-    # 4) Embeddings (pour backend=transformer)
+    # Classification via Transformer gele
     if args.backend == "transformer":
+        # Chunking
         steps.append(PipelineStep(
             ChunkingOp(ChunkingConfig(
                 hf_model=args.hf_model,
                 chunk_size=args.chunk_size,
                 overlap=args.chunk_overlap,
-                field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent
+                field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent, et sut texte initial si pas de normalisation
                 field_out="chunks",
             )),
             [last_docs], ["docs_chunk"]
         ))
-
+        # Calcul des embeddings par chunk
         steps.append(PipelineStep(
             TransformerEmbedOp(EmbedConfig(
                 hf_model=args.hf_model,
@@ -151,14 +184,13 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )),
             ["docs_chunk"], ["docs_tr"]
         ))
-
+        # Aggregation des embeddings
         steps.append(PipelineStep(
             AggregateChunksOp(strategy=args.aggregate),
             ["docs_tr"], ["docs_ag"]
         ))
 
-
-        # 5) DP Head
+        # Tete de classification
         steps.append(PipelineStep(
             TransformerDPHeadOp(DPHeadConfig(
                 bundle_path=str(args.bundle_path),
@@ -172,10 +204,11 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             ["docs_ag"], ["docs_out"]
         ))
 
+    # Classification via Transformer finetune
     elif args.backend == "hf_finetuned":
         if not args.hf_checkpoint:
             raise ValueError("Veuillez fournir --hf-checkpoint (dossier HF sauvegardé par train_finetune_dp.py)")
-        # ----- modèle HF fine-tuné pour le DP -----
+
         steps.append(PipelineStep(
             HFDocClassifierOp(HFDocPredictConfig(
                 checkpoint_dir=args.hf_checkpoint,
@@ -189,16 +222,15 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )),
             [last_docs], ["docs_out"]
         ))
-
+    # Prediction via LLM 
     elif args.backend == "llm":
-        # 4) LLM direct (pas d'embeddings)
         steps.append(PipelineStep(
             LLMDPInferenceOp(LLMDPConfig(
                 hf_model=args.llm_model,
                 max_new_tokens=args.llm_max_new_tokens,
                 temperature=args.llm_temperature,
                 top_p=args.llm_top_p,
-                field_in="text_rw",          # retombe sur text_norm si absent
+                field_in="text_rw",          # retombe sur text_norm si absent, texte initial si pas de normalisation
                 pred_field="pred_dp",
             )),
             [last_docs], ["docs_out"]
@@ -241,10 +273,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rewrite-temperature", type=float, default=0.3)
     p.add_argument("--rewrite-top-p", type=float, default=0.95)
 
+    #Chunking
     p.add_argument("--chunk-size", type=int, default=480)
     p.add_argument("--chunk-overlap", type=int, default=64)
 
-    # Modèle encoder (transformer)
+    # Modèle transformer gele
     p.add_argument("--hf-model", default="almanach/camembert-bio-base")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--max-length", type=int, default=512)
@@ -260,7 +293,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aggregate_hf", choices=["mean", "max", "median"], default="mean")
 
 
-    # LLM (Transformers)
+    # LLM 
     p.add_argument("--llm-model", default="mistralai/Mistral-7B-Instruct-v0.3")
     p.add_argument("--llm-max-new-tokens", type=int, default=64)
     p.add_argument("--llm-temperature", type=float, default=0.0)
@@ -293,13 +326,11 @@ def main():
     # Exécuter
     docs_out = pipe.run(docs)
 
-        # Écrire résultats (+ métriques si demandé)
+    # Écrire résultats (+ métriques si demandé)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-
     use_metrics = getattr(args, "with_metrics", False) and getattr(args, "rewrite", False)
 
     if not use_metrics:
-        # Chemin classique
         write_preds_to_csv(docs_out, args.output_csv, args.out_col_sejour, args.out_col_pred)
     else:
         # ---- Construction CSV avec métriques ----
@@ -309,8 +340,6 @@ def main():
             mb = d.metadata.get("metrics_before") or {}
             ma = d.metadata.get("metrics_after") or {}
             return sorted(set(mb.keys()) | set(ma.keys()))
-
-        
 
         # Récupère l’ensemble des clés de métriques présentes dans tout le lot
         all_keys = set()
@@ -335,7 +364,6 @@ def main():
         df.to_csv(args.output_csv, index=False)
 
         # ---- Affichage des moyennes globales ----
-        # On calcule la moyenne colonne par colonne uniquement pour les colonnes numériques
         numeric_cols = [c for c in df.columns if c.endswith("_before") or c.endswith("_after")]
         means = df[numeric_cols].mean(numeric_only=True)
 
@@ -346,7 +374,7 @@ def main():
             a_mean = means.get(a_col, float("nan"))
             print(f"  - {k:20s}  before={b_mean:.3f}  |  after={a_mean:.3f}")
 
-    # Affichage bref
+    # Affichage final
     n_pred = sum(1 for d in docs_out if d.metadata.get("pred_dp"))
     print(f"[OK] Documents: {len(docs_out)} | DP prédits: {n_pred} | sortie: {args.output_csv}")
 

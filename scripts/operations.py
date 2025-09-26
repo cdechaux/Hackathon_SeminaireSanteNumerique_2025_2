@@ -1,14 +1,27 @@
-#!/usr/bin/env python3
-# operations.py
-# Opérations medkit pour un pipeline DP-only, via Transformers.
-# - NormalizeOp : nettoyage léger du texte
-# - RewriteOp   : réécriture optionnelle (via LLM HF ou no-op)
-# - ChunkingOp  : découpe en fenêtres de tokens (overlap)
-# - TransformerEmbedOp : embeddings document (agrégation de chunks)
-# - TransformerDPHeadOp : entraînement / prédiction d’un DP multiclasse (LogReg)
-# - LLMDPInferenceOp    : prédiction DP via LLM HF (génération + extraction regex)
-#
-# Aucune troncature/modification des codes : les points sont conservés.
+"""
+operations.py
+=============
+Ce fichier regroupe des premieres opérations Medkit utilisées dans le pipeline de 
+classification du Diagnostic Principal (DP) à partir de comptes rendus hospitaliers.
+
+Opérations principales :
+------------------------
+- **NormalizeOp** : nettoyage léger du texte (espaces, sauts de lignes).
+- **MetricsTextOp** : calcule des métriques simples sur le texte 
+  (longueur, phrases, vocabulaire, sections, abréviations).
+- **RewriteOp** : réécriture via un modèle LLM HF (ex : Mistral Instruct).
+- **ChunkingOp** : découpe du texte en morceaux (chunks) de tokens avec overlap.
+- **TransformerEmbedOp** : extraction d’embeddings avec un modèle HF.
+- **TransformerDPHeadOp** : classification DP via Logistic Regression sur embeddings.
+- **HFDocClassifierOp** : classification DP via un modèle HF fine-tuné.
+- **LLMDPInferenceOp** : classification DP via génération directe avec un LLM.
+
+Notes :
+-------
+- Les codes CIM-10 sont conservés tels quels (points inclus).
+- Chaque opération enrichit `metadata` des documents pour être chaînée dans un pipeline.
+"""
+
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -62,18 +75,18 @@ def _count_abbr(text: str) -> int:
 
 
 
-# --------------------------- 1) Normalize -------------------------------
+# --------------------------- 1) Normalisation -------------------------------
 
 @dataclass
 class NormalizeConfig:
     strip: bool = True
     collapse_spaces: bool = True
     normalize_newlines: bool = True
-    lower: bool = False      # False par défaut (les acronymes FR comptent)
+    lower: bool = False     
     keep_accents: bool = True
 
 class NormalizeOp(Operation):
-    """Nettoyage léger du texte du CRH (aucune agressivité)."""
+    """Nettoyage leger du texte."""
     def __init__(self, cfg: Optional[NormalizeConfig] = None):
         super().__init__()
         self.cfg = cfg or NormalizeConfig()
@@ -100,14 +113,14 @@ class NormalizeOp(Operation):
         return docs
 
 
-# --------------------------- 2) Rewrite --------------------------------
+# --------------------------- 2) Metriques de texte et Reecriture --------------------------------
 
 
 @dataclass
 class MetricsTextConfig:
-    text_field: str = "text"          # clé de lecture du texte
-    metrics_root: str = "metrics"     # ou ecrire les metriques, ex :d.metadata["metrics"][phase] = {...}
-    phase: str = "before"             # "before" | "after"
+    text_field: str = "text"          
+    metrics_root: str = "metrics"    
+    phase: str = "before"          
     lowercase: bool = True
     remove_accents: bool = True
 
@@ -168,7 +181,7 @@ class MetricsTextOp(Operation):
 class RewriteConfig:
     enabled: bool = False
     target_words: Optional[int] = None
-    llm_model: Optional[str] = None            # modèle HF causal LM pour paraphrase
+    llm_model: Optional[str] = None           
     max_new_tokens: int = 128
     temperature: float = 0.3
     top_p: float = 0.95
@@ -208,7 +221,6 @@ class RewriteOp(Operation):
         ]
 
         # 2) Prompt via le chat template DU TOKENIZER DU MODÈLE
-        # (Très important : template propre à Mistral-Instruct)
         prompt_ids = self._tok.apply_chat_template(
             messages, add_generation_prompt=True, return_tensors="pt"
         )
@@ -227,7 +239,7 @@ class RewriteOp(Operation):
             repetition_penalty=1.1,   # aide à éviter le copiage
         )
 
-        # 4) NE GARDER QUE LA RÉPONSE (nouveaux tokens)
+        # 4) Ne garder que la reponse (nouveaux tokens)
         new_tokens = out_ids[0, input_len:]
         gen = self._tok.decode(new_tokens, skip_special_tokens=True).strip()
 
@@ -245,15 +257,15 @@ class RewriteOp(Operation):
         return docs
 
 
-# --------------------------- 3) Chunking (token) ------------------------
+# --------------------------- 3) Chunking  ------------------------
 
 @dataclass
 class ChunkingConfig:
-    hf_model: str                      # tokenizer pour compter les tokens
-    chunk_size: int = 480              # en tokens
-    overlap: int = 64                  # en tokens
-    field_in: str = "text_rw"          # ou "text_norm" si pas de rewrite
-    field_out: str = "chunks"          # liste de str
+    hf_model: str                      
+    chunk_size: int = 480             
+    overlap: int = 64                  
+    field_in: str = "text_rw"         
+    field_out: str = "chunks"       
 
 class ChunkingOp(Operation):
     def __init__(self, cfg: ChunkingConfig):
@@ -263,7 +275,7 @@ class ChunkingOp(Operation):
 
     def run(self, docs: Sequence[TextDocument]):
         for d in docs:
-            text = (d.metadata.get(self.cfg.field_in) or d.text or "").strip()
+            text = (d.metadata.get(self.cfg.field_in) or d.metadata.get("text_norm") or d.text or "").strip()
             if not text:
                 d.metadata[self.cfg.field_out] = []
                 continue
@@ -368,14 +380,12 @@ class TransformerEmbedOp(Operation):
             if not chunks:
                 chunks = [ (d.metadata.get("text_rw") or d.text or "") ]
             embs = self._embed_texts(chunks)
-            # Agrégation plus tard → on stocke les embs de chunks pour l’instant ?
-            # Si tu veux déjà agrégér ici, tu peux faire une moyenne directement.
             d.metadata["chunk_embs"] = [e for e in embs]
         return list(docs)
 
 
 
-# --------------------------- 5) Tête DP (Transformer) -------------------
+# --------------------------- 5) Tête de classification DP avec Transformer gele -------------------
 
 @dataclass
 class DPHeadConfig:
@@ -456,11 +466,11 @@ class TransformerDPHeadOp(Operation):
             raise ValueError("mode doit être 'train' ou 'predict'")
         
 
-# --------------------------- 6) Transformer finetune ------------------
+# --------------------------- 6) Classification DP avec Transformer finetune ------------------
 
 @dataclass
 class HFDocPredictConfig:
-    checkpoint_dir: str                # dossier du checkpoint HF (celui de train_finetune_dp.py)
+    checkpoint_dir: str                # dossier du checkpoint HF (celui issu de train_finetune_dp.py)
     device: str = "auto"               # "cuda" / "cpu" / "auto"
     max_length: int = 384              # par sécurité si chunks absents
     stride: int = 64                   # idem
@@ -536,7 +546,7 @@ class HFDocClassifierOp(Operation):
 
 
 
-# --------------------------- 7) LLM DP (Transformers) -------------------
+# --------------------------- 7) Prediction du code DP via LLM -------------------
 
 @dataclass
 class LLMDPConfig:

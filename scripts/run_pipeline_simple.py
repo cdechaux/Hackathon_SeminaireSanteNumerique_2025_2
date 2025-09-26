@@ -1,9 +1,29 @@
-#!/usr/bin/env python3
-# run_pipeline.py
-# Pipeline medkit complet (DP uniquement) avec backend Transformers :
-#  - Normalize → (Rewrite?) → Chunk → Embed → (TransformerDPHeadOp | LLMDPInferenceOp)
-# Entrée : CSV avec colonnes configurables (code, text, code_patient, code_sejour)
-# Sortie : CSV minimal (code_sejour, dp_predit) avec noms de colonnes configurables.
+"""
+Pipeline simple pour prediction du Diagnostic Principal (DP) à partir de comptes rendus hospitaliers.
+
+Étapes principales :
+1. Lecture d’un CSV d’entrée et création de TextDocument (medkit).
+2. Normalisation légère du texte (espaces, sauts de ligne).
+3. Découpage en chunks de tokens (avec overlap).
+4. Encodage des chunks avec un modèle Transformer (CamemBERT-Bio par défaut).
+5. Agrégation des embeddings de chunks en un vecteur par document.
+6. Classification multiclasse avec une régression logistique (tête simple DP).
+
+Deux modes pour backend transformer :
+- train   : ajuste la tête de classification (LogReg) et sauvegarde un bundle .joblib
+- predict : recharge un bundle existant et applique le modèle aux nouveaux textes
+
+Entrées :
+- CSV avec colonnes texte, séjour, patient, (et éventuellement DP gold)
+- Paramètres configurables via la CLI (modèle HF, chunk size, pooling, etc.)
+
+Sorties :
+- CSV avec pour chaque séjour le DP prédit
+
+Ce script sert de pipeline *de base* pour le hackathon.
+Les participants peuvent l’utiliser tel quel ou le modifier (autres modèles,
+ajout de réécriture, métriques, fine-tuning complet, etc.).
+"""
 
 from __future__ import annotations
 import argparse
@@ -16,13 +36,10 @@ from medkit.core.text import TextDocument
 
 from operations import (
     NormalizeConfig, NormalizeOp,
-    MetricsTextOp, MetricsTextConfig,
-    RewriteConfig, RewriteOp,
     ChunkingConfig, ChunkingOp, AggregateChunksOp,
     EmbedConfig, TransformerEmbedOp,
     DPHeadConfig, TransformerDPHeadOp,
-    HFDocPredictConfig, HFDocClassifierOp,
-    LLMDPConfig, LLMDPInferenceOp,
+
 )
 
 # ----------------------- I/O helpers -----------------------
@@ -61,12 +78,12 @@ def write_preds_to_csv(docs: List[TextDocument], out_csv: Path, out_col_sejour: 
         w.writerows(rows)
 
 
-# ----------------------- Pipeline builder -----------------------
+# ----------------------- Construction du pipeline  -----------------------
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
     steps: List[PipelineStep] = []
 
-    # 1) Normalisation
+    # 1) Normalisation des textes
 
     steps.append(PipelineStep(
         NormalizeOp(NormalizeConfig(
@@ -79,7 +96,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         ["docs_in"], ["docs_norm"]
     ))
 
-    # 2) Normalisation des textes
+    # 2) Chunking des textes
 
     steps.append(PipelineStep(
         ChunkingOp(ChunkingConfig(
@@ -115,7 +132,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
     ))
 
 
-    # 5) Tete de classification
+    # 5) Tete de classification avec Transformer gele
 
     steps.append(PipelineStep(
         TransformerDPHeadOp(DPHeadConfig(
@@ -185,17 +202,17 @@ def main():
     if not docs:
         raise SystemExit("Aucun document lu depuis le CSV d'entrée.")
 
-    # Construire pipeline
+    # Construire le pipeline
     pipe = build_pipeline(args)
 
     # Exécuter
     docs_out = pipe.run(docs)
 
-    # Écrire résultats (+ métriques si demandé)
+    # Écrire les résultats
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     write_preds_to_csv(docs_out, args.output_csv, args.out_col_sejour, args.out_col_pred)
    
-    # Affichage bref
+    # Affichage 
     n_pred = sum(1 for d in docs_out if d.metadata.get("pred_dp"))
     print(f"[OK] Documents: {len(docs_out)} | DP prédits: {n_pred} | sortie: {args.output_csv}")
 
