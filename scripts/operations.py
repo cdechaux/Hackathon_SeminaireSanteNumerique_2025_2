@@ -197,7 +197,7 @@ class RewriteOp(Operation):
         sys_msg = (
             "Tu es un assistant clinique. Réécris et condense un compte rendu hospitalier "
             "en français clair, sans inventer d'informations, en préservant les diagnostics, "
-            "pathologies et conduites thérapeutiques, pour faciliter l’extraction du DP."
+            "pathologies et conduites thérapeutiques, pour faciliter l’extraction du Diagnostic principal. Commence toujours par la conclusion s'il y en a une."
         )
         user_msg = (
             f"Réécris le texte suivant{target}. Ne copie pas mot à mot, synthétise :\n\n{text.strip()}"

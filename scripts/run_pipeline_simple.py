@@ -76,7 +76,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             lower=False,
             keep_accents=True,
         )),
-        [last_docs], ["docs_norm"]
+        ["docs_in"], ["docs_norm"]
     ))
 
     # 2) Normalisation des textes
@@ -86,10 +86,10 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             hf_model=args.hf_model,
             chunk_size=args.chunk_size,
             overlap=args.chunk_overlap,
-            field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent
+            field_in="text_norm",   
             field_out="chunks",
         )),
-        [last_docs], ["docs_chunk"]
+        ["docs_norm"], ["docs_chunk"]
     ))
 
     # 3) Calcul des embeddings des textes
@@ -151,7 +151,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-col-sejour", default="code_sejour")
     p.add_argument("--out-col-pred", default="dp_predit")
 
+    # Chunking
+    p.add_argument("--chunk-size", type=int, default=480)
+    p.add_argument("--chunk-overlap", type=int, default=64)
+
     # Modèle encoder (transformer)
+    p.add_argument("--mode", choices=["train", "predict"], default="predict")
     p.add_argument("--hf-model", default="almanach/camembert-bio-base")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--max-length", type=int, default=512)
@@ -173,7 +178,7 @@ def main():
     docs = load_docs_from_csv(
         args.input_csv,
         col_text=args.col_text,
-        col_dp=args.col_dp if args.mode == "train" else None,
+        col_dp=args.col_dp,
         col_patient=args.col_patient,
         col_sejour=args.col_sejour,
     )

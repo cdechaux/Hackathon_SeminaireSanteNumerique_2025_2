@@ -2,7 +2,7 @@
 #SBATCH --job-name=pipeline_ssn
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1 # évite les 1080 Ti ; sinon: --gres=gpu:1 --exclude=gpu004
-#SBATCH --constraint="h100|a100|v100"
+
 #SBATCH -c 8
 #SBATCH --mem=40G
 #SBATCH --time=03:00:00           
@@ -40,6 +40,7 @@ python scripts/run_pipeline_simple.py \
   --input-csv data/dp_dataset_small.csv \
   --output-csv data/pred_simple.csv \
   --col-dp code_dp \
+  --mode train
 
 #python scripts/create_rewrite_dataset.py \
 #  --input-csv data/dp_dataset.csv \
