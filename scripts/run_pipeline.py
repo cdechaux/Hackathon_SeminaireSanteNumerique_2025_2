@@ -218,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-csv", type=Path, required=True)
 
     # Colonnes d'entrée
-    p.add_argument("--col-text", default="text")
+    p.add_argument("--col-text", default="text")   # "text_rw" si on tourne sur dataset reecrit 
     p.add_argument("--col-dp", default=None, help="Nom de la colonne gold DP (requis en mode train)")
     p.add_argument("--col-patient", default="code_patient")
     p.add_argument("--col-sejour", default="code_sejour")
@@ -321,8 +321,8 @@ def main():
         rows = []
         for d in docs_out:
             row = {
-                args.out_col_sejour: d.metadata.get("code_sejour"),
-                args.out_col_pred: pred_dp.strip() or "",
+                args.out_col_sejour: d.metadata.get("id_sejour", ""),
+                args.out_col_pred: d.metadata.get("pred_dp", ""),
             }
             mb = d.metadata.get("metrics_before") or {}
             ma = d.metadata.get("metrics_after") or {}

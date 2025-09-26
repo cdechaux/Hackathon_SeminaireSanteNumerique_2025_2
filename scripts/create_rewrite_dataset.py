@@ -27,7 +27,7 @@ def build_pipeline(args) -> Pipeline:
             metrics_root="metrics",
             phase="before"
         )),
-        ["docs"], ["docs"]
+        ["docs"], ["docs_b"]
     ))
     # Rewrite
     steps.append(PipelineStep(
@@ -39,7 +39,7 @@ def build_pipeline(args) -> Pipeline:
             temperature=args.temperature,
             top_p=args.top_p,
         )),
-        ["docs"], ["docs"]
+        ["docs_b"], ["docs_r"]
     ))
     # Metrics AFTER (sur text_rw)
     steps.append(PipelineStep(
@@ -48,7 +48,7 @@ def build_pipeline(args) -> Pipeline:
             metrics_root="metrics",
             phase="after"
         )),
-        ["docs"], ["docs_out"]
+        ["docs_r"], ["docs_out"]
     ))
     return Pipeline(steps=steps, input_keys=["docs"], output_keys=["docs_out"], name="rewrite_metrics")
 

@@ -26,15 +26,20 @@ conda activate pt_env
 pip install -r requirements.txt
 
 # --- Lancement ---
-python scripts/run_pipeline.py \
+#python scripts/run_pipeline.py \
+#  --input-csv data/dp_dataset_small.csv \
+#  --output-csv data/pred.csv \
+#  --mode predict \
+#  --backend transformer \
+#  --col-dp code_dp \
+#  --rewrite \
+#  --rewrite-llm-model mistralai/Mistral-7B-Instruct-v0.3 \
+#  --with-metrics
+
+python scripts/run_pipeline_simple.py \
   --input-csv data/dp_dataset_small.csv \
-  --output-csv data/pred.csv \
-  --mode predict \
-  --backend transformer \
+  --output-csv data/pred_simple.csv \
   --col-dp code_dp \
-  --rewrite \
-  --rewrite-llm-model mistralai/Mistral-7B-Instruct-v0.3 \
-  --with-metrics
 
 #python scripts/create_rewrite_dataset.py \
 #  --input-csv data/dp_dataset.csv \

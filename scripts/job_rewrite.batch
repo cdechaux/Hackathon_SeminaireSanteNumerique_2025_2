@@ -34,6 +34,6 @@ python scripts/create_rewrite_dataset.py \
   --text-col text \
   --llm-model mistralai/Mistral-7B-Instruct-v0.3\
   --target-words 300 \
-  --max-new-tokens 200 \
+  --max-new-tokens 600 \
   --temperature 0.3 \
   --top_p 0.95

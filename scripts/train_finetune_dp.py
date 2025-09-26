@@ -107,7 +107,7 @@ class WeightedTrainer(Trainer):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input-csv", required=True, help="CSV avec colonnes texte & label")
-    p.add_argument("--text-col", default="text")
+    p.add_argument("--text-col", default="text")  # "text_rw" si on tourne sur dataset reecrit 
     p.add_argument("--label-col", default="code_dp")
     p.add_argument("--output-dir", default="checkpoints/camembert_dp_ft")
     p.add_argument("--pretrained", default="almanach/camembert-bio-base")

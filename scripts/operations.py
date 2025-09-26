@@ -189,27 +189,51 @@ class RewriteOp(Operation):
     def _rewrite_with_llm(self, text: str) -> str:
         if not text:
             return ""
-        assert self._tok and self._lm
-        target = f"\nLongueur cible: ~{self.cfg.target_words} mots." if self.cfg.target_words else ""
-        prompt = (
-            "Réécris et résume le compte rendu hospitalier ci-dessous en gardant le sens clinique, "
-            "en français clair, sans inventer d'informations, sachant que le but final sera de pouvoir éxtraire le diagnostic principal. " + target +
-            "\nTexte:\n" + text.strip()
+
+        assert self._tok is not None and self._lm is not None
+
+        # 1) Messages structurés (spécifiques au modèle Instruct)
+        target = f" (~{self.cfg.target_words} mots)" if self.cfg.target_words else ""
+        sys_msg = (
+            "Tu es un assistant clinique. Réécris et condense un compte rendu hospitalier "
+            "en français clair, sans inventer d'informations, en préservant les diagnostics, "
+            "pathologies et conduites thérapeutiques, pour faciliter l’extraction du DP."
         )
-        tok = self._tok(prompt, return_tensors="pt", truncation=True, max_length=4096)
-        tok = {k: v.to(self._lm.device) for k, v in tok.items()}
-        out = self._lm.generate(
-            **tok,
+        user_msg = (
+            f"Réécris le texte suivant{target}. Ne copie pas mot à mot, synthétise :\n\n{text.strip()}"
+        )
+        messages = [
+            {"role": "system", "content": sys_msg},
+            {"role": "user",   "content": user_msg},
+        ]
+
+        # 2) Prompt via le chat template DU TOKENIZER DU MODÈLE
+        # (Très important : template propre à Mistral-Instruct)
+        prompt_ids = self._tok.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
+        prompt_ids = prompt_ids.to(self._lm.device)
+        input_len = prompt_ids.shape[1]
+
+        # 3) Génération
+        out_ids = self._lm.generate(
+            prompt_ids,
             do_sample=True,
             temperature=self.cfg.temperature,
             top_p=self.cfg.top_p,
             max_new_tokens=self.cfg.max_new_tokens,
+            eos_token_id=self._tok.eos_token_id,
             pad_token_id=self._tok.eos_token_id,
+            repetition_penalty=1.1,   # aide à éviter le copiage
         )
-        gen = self._tok.decode(out[0], skip_special_tokens=True)
-        # Récupère la partie après "Texte:" si le modèle recopie le prompt
-        parts = gen.split("Texte:")
-        return parts[-1].strip() if parts else gen.strip()
+
+        # 4) NE GARDER QUE LA RÉPONSE (nouveaux tokens)
+        new_tokens = out_ids[0, input_len:]
+        gen = self._tok.decode(new_tokens, skip_special_tokens=True).strip()
+
+        # 5) Nettoyage léger
+        return gen
+
 
     def run(self, docs: Sequence[TextDocument]):
         for d in docs:
