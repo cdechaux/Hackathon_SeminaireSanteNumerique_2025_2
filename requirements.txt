@@ -5,7 +5,7 @@ scikit-learn>=1.4,<1.6
 joblib>=1.3,<2.0
 tqdm>=4.66,<5.0
 
-# --- Inference Transformers (100% local) ---
+# --- Inference Transformers, Medkit ... ---
 torch>=2.4,<2.6           # CPU/GPU selon machine 
 transformers>=4.43,<5.0
 accelerate>=0.31,<1.0
@@ -16,9 +16,5 @@ datasets
 protobuf
 regex>=2024.5.15
 
-
-# --- Medkit (pipeline, documents, opérations) ---
 medkit-lib>=0.17.0
 
-# --- Optionnel (décommente si besoin) ---
-# bitsandbytes>=0.43        # quantification 4/8-bit (Linux recommandé)
