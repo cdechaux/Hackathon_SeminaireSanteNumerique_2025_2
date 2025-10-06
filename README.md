@@ -1,6 +1,6 @@
 # Hackathon_SeminaireSanteNumerique_2025_2
 
-Outils de référence pour coder le **Diagnostic Principal (DP)** à partir de comptes-rendus hospitaliers, avec un pipeline modulaire basé sur **medkit** et **Transformers**.
+Outils pour coder le **Diagnostic Principal (DP)** à partir de comptes-rendus hospitaliers, avec un pipeline modulaire basé sur **medkit** et **Transformers**.
 Le repo propose :
 
 * un **pipeline simple** de base (embeddings + régression logistique),
