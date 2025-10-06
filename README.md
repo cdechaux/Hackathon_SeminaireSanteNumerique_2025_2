@@ -64,7 +64,7 @@ Le repo propose :
 * **Python 3.10 – 3.12** recommandé (Sur certains clusters, tokenizers nécessite une version Python supportée par pyo3. Évitez Python 3.13.)
 * GPU NVIDIA (optionnel mais recommandé) + CUDA pour l’inférence/entraînement rapides
 
-Création et activetion environnement, par exemple :
+Création et activation d'un environnement, par exemple :
 
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
