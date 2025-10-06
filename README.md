@@ -27,9 +27,6 @@ Le repo propose :
 * [Backends de classification](#backends-de-classification)
 * [Options principales](#options-principales)
 * [Jobs SLURM](#jobs-slurm)
-* [Bonnes pratiques & conseils](#bonnes-pratiques--conseils)
-* [Dépannage](#dépannage)
-* [Licence](#licence)
 
 ---
 
