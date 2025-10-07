@@ -11,6 +11,7 @@ Opérations principales :
   (longueur, phrases, vocabulaire, sections, abréviations).
 - **RewriteOp** : réécriture via un modèle LLM HF (ex : Mistral Instruct).
 - **ChunkingOp** : découpe du texte en morceaux (chunks) de tokens avec overlap.
+- **AggregateChunksOp** : aggrègation des embeddings des différents chunks d'un texte.
 - **TransformerEmbedOp** : extraction d’embeddings avec un modèle HF.
 - **TransformerDPHeadOp** : classification DP via Logistic Regression sur embeddings.
 - **HFDocClassifierOp** : classification DP via un modèle HF fine-tuné.
@@ -316,8 +317,13 @@ class AggregateChunksOp(Operation):
             X = np.vstack(arrs)
             if self.strategy == "mean":
                 emb = X.mean(0)
-            else:
-                emb = X.mean(0)  # fallback
+            if  self.strategy == "median":
+                emb = X.median(0)
+            if self.strategy == "max":
+                emb = X.max(0)
+            else :
+              print("Stratégie d'aggrégation des embeddings dans AggregateChunksOp non ou mal définie : aggrégation par moyenne par défaut")
+              emb = X.mean(0) 
             d.metadata[self.emb_field] = emb.astype(np.float32)
         return list(docs)
 
