@@ -37,7 +37,7 @@ Le repo propose :
 ├── assets/                         # (optionnel) poids, bundles, etc.
 ├── checkpoints/                    # modèles entraînés & artefacts (créés à l'exécution)
 ├── data/                           # jeux de données (CSV) & sorties
-├── data/                           # Logs d'exectution des jobs
+├── logs/                           # Logs d'exectution des jobs
 ├── README.md
 ├── requirements.txt
 └── scripts/
