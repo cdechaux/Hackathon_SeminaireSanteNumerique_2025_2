@@ -122,6 +122,9 @@ python scripts/run_pipeline_simple.py \
 
 ### Pipeline complet et modulaire
 
+![schema_pipeline_complet](assets/schema_pipeline_hackathon.png)
+
+
 Ajoutez/supprimez des étapes (normalisation, réécriture LLM, chunking, etc.).
 
 
