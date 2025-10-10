@@ -304,7 +304,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aggregate", choices=["mean", "max", "first"], default="mean",help="Stratégie d’agrégation des embeddings de chunks en un seul vecteur doc.")
 
     # Transformer finetune
-    p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné")
+    p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné")  #penser a preciser '/final' dans le chemin 
     p.add_argument("--hf-batch-size", type=int, default=16)
     p.add_argument("--aggregate_hf", choices=["mean", "max", "median"], default="mean")
 

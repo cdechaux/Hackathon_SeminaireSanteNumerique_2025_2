@@ -317,9 +317,9 @@ class AggregateChunksOp(Operation):
             X = np.vstack(arrs)
             if self.strategy == "mean":
                 emb = X.mean(0)
-            if  self.strategy == "median":
+            elif self.strategy == "median":
                 emb = X.median(0)
-            if self.strategy == "max":
+            elif self.strategy == "max":
                 emb = X.max(0)
             else :
               print("Stratégie d'aggrégation des embeddings dans AggregateChunksOp non ou mal définie : aggrégation par moyenne par défaut")
