@@ -120,6 +120,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             cls_layers=args.cls_layers,
             chunks_field="chunks",
             emb_field="emb",
+            batch_size=args.embed_batch_size,
         )),
         ["docs_chunk"], ["docs_tr"]
     ))
@@ -175,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     # Modèle encoder (transformer)
     p.add_argument("--mode", choices=["train", "predict"], default="predict")
     p.add_argument("--hf-model", default="almanach/camembert-bio-base")
+    p.add_argument("--embed-batch-size", type=int, default=16)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--pooling", choices=["cls", "mean"], default="cls")

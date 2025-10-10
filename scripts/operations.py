@@ -340,6 +340,7 @@ class EmbedConfig:
     cls_layers: int = 4
     chunks_field: str = "chunks"
     emb_field: str = "emb"
+    batch_size: int = 16
 
 class TransformerEmbedOp(Operation):
     def __init__(self, cfg: EmbedConfig):
@@ -360,25 +361,34 @@ class TransformerEmbedOp(Operation):
         if not texts:
             D = self.enc.config.hidden_size
             return np.zeros((0, D), dtype=np.float32)
-        batch = self.tok(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.max_length,
-            return_tensors="pt"
-        ).to(self.device)
-        out = self.enc(**batch)
 
-        if self.cfg.pooling == "cls4":
-            hs = torch.stack(out.hidden_states[-self.cfg.cls_layers:])  # (L,B,T,D)
-            embs = hs[:, :, 0, :].mean(0)  # (B,D)
-        else:
-            last = out.last_hidden_state
-            mask = batch["attention_mask"].unsqueeze(-1)
-            embs = (last * mask).sum(1) / mask.sum(1).clamp(min=1)
+        all_embs: list[np.ndarray] = []
+        bs = max(1, int(self.cfg.batch_size))
+        for i in range(0, len(texts), bs):
+            batch_texts = texts[i:i+bs]
+            batch = self.tok(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=self.cfg.max_length,
+                return_tensors="pt",
+            ).to(self.device)
 
-        embs = torch.nn.functional.normalize(embs, dim=1)
-        return embs.cpu().numpy()
+            out = self.enc(**batch)
+
+            if self.cfg.pooling == "cls4":
+                hs = torch.stack(out.hidden_states[-self.cfg.cls_layers:])  # (L,B,T,D)
+                embs = hs[:, :, 0, :].mean(0)                               # (B,D)
+            else:
+                last = out.last_hidden_state                                 # (B,T,D)
+                mask = batch["attention_mask"].unsqueeze(-1)                 # (B,T,1)
+                embs = (last * mask).sum(1) / mask.sum(1).clamp(min=1)       # (B,D)
+
+            embs = torch.nn.functional.normalize(embs, dim=1)
+            all_embs.append(embs.cpu().numpy())   # bloc (B,D)
+
+        return np.vstack(all_embs)  # (N,D) sur tous les batches
+
 
     def run(self, docs: Sequence[TextDocument]):
         for d in docs:
@@ -484,6 +494,7 @@ class HFDocPredictConfig:
     pred_field: str = "pred_dp"        # sortie
     aggregate: str = "mean"            # "mean" | "max" | "median"
     return_proba: bool = True
+    batch_size: int = 16
 
 class HFDocClassifierOp(Operation):
     """Inférence DP avec un modèle HF fine-tuné (doc-level via agrégation des logits de chunks)."""
@@ -522,23 +533,28 @@ class HFDocClassifierOp(Operation):
     @torch.no_grad()
     def run(self, docs: Sequence[TextDocument]):  # type: ignore[override]
         for d in docs:
-            chunks: Optional[List[str]] = d.metadata.get(self.cfg.chunks_field)  # type: ignore
-            if not chunks:
-                chunks = [d.text]
+            chunks: Optional[List[str]] = d.metadata.get(self.cfg.chunks_field)
+            if not chunks or len(chunks) == 0:
+                chunks = [d.text or ""]
 
-            chunk_logits = []
-            for ch in chunks:
+            rows: list[np.ndarray] = []
+            bs = max(1, int(self.cfg.batch_size))
+            for i in range(0, len(chunks), bs):
+                batch_chunks = chunks[i:i+bs]
                 enc = self.tokenizer(
-                    ch, truncation=True, padding=False,
-                    max_length=self.cfg.max_length, return_tensors="pt"
+                    batch_chunks,
+                    truncation=True,
+                    padding=True,
+                    max_length=self.cfg.max_length,
+                    return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
-                out = self.model(**enc)
-                logit = out.logits.detach().cpu().numpy()  # (1, num_labels)
-                chunk_logits.append(logit[0])
+                out = self.model(**enc)                         # logits: (B, C)
+                mat = out.logits.detach().cpu().numpy()         # (B, C)
+                rows.extend(mat)                                 # list de (C,)
 
-            logits = np.stack(chunk_logits, axis=0)          # (n_chunks, num_labels)
-            agg = self._aggregate(logits)                     # (num_labels,)
+            logits = np.asarray(rows)                            # (N, C)
+            agg = self._aggregate(logits)                        # (C,)
             pred_id = int(np.argmax(agg))
             label = self.id2label.get(pred_id, str(pred_id))
 

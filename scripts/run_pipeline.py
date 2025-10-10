@@ -181,6 +181,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 cls_layers=args.cls_layers,
                 chunks_field="chunks",
                 emb_field="emb",
+                batch_size=args.embed_batch_size,
             )),
             ["docs_chunk"], ["docs_tr"]
         ))
@@ -219,6 +220,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 pred_field="pred_dp",
                 aggregate=args.aggregate_hf,
                 return_proba=True,
+                batch_size=args.hf_batch_size,
             )),
             [last_docs], ["docs_out"]
         ))
@@ -279,6 +281,7 @@ def parse_args() -> argparse.Namespace:
 
     # Modèle transformer gele
     p.add_argument("--hf-model", default="almanach/camembert-bio-base")
+    p.add_argument("--embed-batch-size", type=int, default=16)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--pooling", choices=["cls", "mean"], default="cls")
@@ -290,6 +293,7 @@ def parse_args() -> argparse.Namespace:
 
     # Transformer finetune
     p.add_argument("--hf-checkpoint", type=str, help="Dossier checkpoint HF fine-tuné")
+    p.add_argument("--hf-batch-size", type=int, default=16)
     p.add_argument("--aggregate_hf", choices=["mean", "max", "median"], default="mean")
 
 
