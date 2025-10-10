@@ -210,6 +210,18 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
         if not args.hf_checkpoint:
             raise ValueError("Veuillez fournir --hf-checkpoint (dossier HF sauvegardé par train_finetune_dp.py)")
 
+        # Chunking
+        steps.append(PipelineStep(
+            ChunkingOp(ChunkingConfig(
+                hf_model=args.hf_model,
+                chunk_size=args.chunk_size,
+                overlap=args.chunk_overlap,
+                field_in="text_rw",   # ChunkingOp tombera sur text_norm si text_rw absent, et sut texte initial si pas de normalisation
+                field_out="chunks",
+            )),
+            [last_docs], ["docs_chunk"]
+        ))
+
         steps.append(PipelineStep(
             HFDocClassifierOp(HFDocPredictConfig(
                 checkpoint_dir=args.hf_checkpoint,
@@ -222,7 +234,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 return_proba=True,
                 batch_size=args.hf_batch_size,
             )),
-            [last_docs], ["docs_out"]
+            ["docs_chunk"], ["docs_out"]
         ))
     # Prediction via LLM 
     elif args.backend == "llm":

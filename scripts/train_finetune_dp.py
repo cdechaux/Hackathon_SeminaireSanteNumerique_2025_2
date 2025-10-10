@@ -97,6 +97,42 @@ class SimpleTextDataset(torch.utils.data.Dataset):
         item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
         return item
 
+class ChunkedTextDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.enc = encodings
+        self.labels = labels  # liste d'int (1 par chunk)
+    def __len__(self):
+        return len(self.labels)
+    def __getitem__(self, idx):
+        item = {
+            "input_ids": torch.tensor(self.enc["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.enc["attention_mask"][idx]),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+        }
+        if "token_type_ids" in self.enc:
+            item["token_type_ids"] = torch.tensor(self.enc["token_type_ids"][idx])
+        return item
+
+def build_chunked_dataset(df, text_col, label_col, tokenizer, max_length, stride, label2id):
+    input_ids, attention_mask, labels = [], [], []
+    # (optionnel) token_type_ids si dispo
+    for text, lab in zip(df[text_col].astype(str), df[label_col].astype(str)):
+        enc = tokenizer(
+            text,
+            truncation=True,
+            max_length=max_length,
+            return_overflowing_tokens=True,
+            stride=stride,
+            padding=False,
+        )
+        n = len(enc["input_ids"])
+        input_ids.extend(enc["input_ids"])
+        attention_mask.extend(enc["attention_mask"])
+        labels.extend([label2id[lab]] * n)
+    enc_all = {"input_ids": input_ids, "attention_mask": attention_mask}
+    return ChunkedTextDataset(enc_all, labels)
+
+
 class WeightedTrainer(Trainer):
     """Applique des poids de classes dans la cross-entropy."""
     def __init__(self, class_weights: torch.Tensor | None = None, **kwargs):
@@ -138,6 +174,12 @@ def main():
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-total-limit", type=int, default=2)
     p.add_argument("--gradient-accumulation-steps", type=int, default=4)
+
+    # Chunking
+    p.add_argument("--do-chunk", action="store_true", help="Active le training par chunks (fenêtres) au lieu du doc complet")
+    p.add_argument("--chunk-size", type=int, default=480, help="Longueur max des fenêtres (tokens) si --do-chunk")
+    p.add_argument("--chunk-stride", type=int, default=64, help="Chevauchement (tokens) entre fenêtres si --do-chunk")
+
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -162,16 +204,28 @@ def main():
 
     # 4) Tokenizer + Datasets
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=True)
-    train_ds = SimpleTextDataset(
-        texts=train_df[args.text_col].astype(str).tolist(),
-        labels=[label2id[x] for x in train_df[args.label_col].astype(str).tolist()],
-        tokenizer=tokenizer, max_length=args.max_length,
-    )
-    eval_ds = SimpleTextDataset(
-        texts=val_df[args.text_col].astype(str).tolist(),
-        labels=[label2id[x] for x in val_df[args.label_col].astype(str).tolist()],
-        tokenizer=tokenizer, max_length=args.max_length,
-    ) if len(val_df) else None
+
+    if args.do_chunk:
+        # Datasets au niveau CHUNK
+        train_ds = build_chunked_dataset(
+            train_df, args.text_col, args.label_col, tokenizer,
+            max_length=args.chunk_size, stride=args.chunk_stride, label2id=label2id
+        )
+        eval_ds = build_chunked_dataset(
+            val_df, args.text_col, args.label_col, tokenizer,
+            max_length=args.chunk_size, stride=args.chunk_stride, label2id=label2id
+        ) if len(val_df) else None
+    else:
+        train_ds = SimpleTextDataset(
+            texts=train_df[args.text_col].astype(str).tolist(),
+            labels=[label2id[x] for x in train_df[args.label_col].astype(str).tolist()],
+            tokenizer=tokenizer, max_length=args.max_length,
+        )
+        eval_ds = SimpleTextDataset(
+            texts=val_df[args.text_col].astype(str).tolist(),
+            labels=[label2id[x] for x in val_df[args.label_col].astype(str).tolist()],
+            tokenizer=tokenizer, max_length=args.max_length,
+        ) if len(val_df) else None
 
     # 5) Config + Model (HF standard)
     config = AutoConfig.from_pretrained(
